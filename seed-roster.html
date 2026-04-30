@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>PIKE Roster Seeder</title>
+<link rel="stylesheet" href="assets/styles.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="auth-bar">
+    <span id="auth-status">Not signed in</span>
+    <button id="auth-signin">Exec Sign In</button>
+    <button id="auth-signout" style="display:none;">Sign Out</button>
+  </div>
+
+  <header style="padding: 24px 0;">
+    <div class="header-content">
+      <img class="pike-logo" src="assets/pike-wordmark.png" alt="PIKE" style="width:160px;">
+      <div class="subtitle">Roster Seeder</div>
+      <div class="chapter-tag">One-time setup tool</div>
+    </div>
+  </header>
+
+  <div class="card">
+    <div class="card-title">Seed the chapter roster</div>
+    <div class="card-sub">Run this once after setting up Firebase</div>
+
+    <div class="notice">
+      <strong>What this does:</strong> Uploads every row in your CSV/Excel file as a brother in the Firestore <code>roster</code> collection. After running it once, you never need to come back here — use the regular Roster tab in the app for ongoing edits.
+    </div>
+
+    <ol style="font-family: Georgia, serif; font-size: 14px; line-height: 1.8; padding-left: 20px; margin-bottom: 20px;">
+      <li>Sign in with your exec Google account (top right).</li>
+      <li>Click the button below and pick your CSV or Excel file. <code>seed-roster.csv</code> in this repo is a ready-to-use file pre-populated with your current chapter roster.</li>
+      <li>Confirm the count, then push to Firestore.</li>
+    </ol>
+
+    <button class="btn" id="pick-file" type="button">Choose File</button>
+    <input type="file" id="seed-file" accept=".csv,.xlsx,.xls" style="display:none;">
+
+    <div id="preview-box" style="margin-top: 22px; display:none;">
+      <div id="preview-summary" style="margin-bottom: 14px;"></div>
+      <div id="preview-rows" style="max-height: 280px; overflow-y: auto; border: 1px solid var(--light-gold); margin-bottom: 16px;"></div>
+      <button class="btn" id="push-btn" type="button">Push to Firestore</button>
+      <button class="btn btn-ghost" id="cancel-btn" type="button" style="margin-left:8px;">Cancel</button>
+    </div>
+
+    <div id="result-box" style="margin-top: 22px;"></div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">After seeding</div>
+    <div class="card-sub">Next steps</div>
+    <p style="font-family: Georgia, serif; font-size: 14px; line-height: 1.7;">
+      Once the roster is in Firestore, head back to <a href="index.html" style="color: var(--garnet); font-weight: bold;">the main app</a> and you're done. Brothers can check in immediately. Exec can add, remove, or import more brothers from the Roster tab.
+    </p>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script type="module">
+import { authApi, roster } from "./js/data.js";
+
+const $ = id => document.getElementById(id);
+let parsed = null;
+
+function toast(msg, isError) {
+  const el = $("toast");
+  el.textContent = msg;
+  el.classList.toggle("error", !!isError);
+  el.classList.add("show");
+  setTimeout(() => el.classList.remove("show"), 2600);
+}
+
+authApi.onChange(user => {
+  $("auth-status").innerHTML = user
+    ? `Signed in as <strong>${user.email}</strong>`
+    : "Not signed in";
+  $("auth-signin").style.display  = user ? "none" : "";
+  $("auth-signout").style.display = user ? ""    : "none";
+});
+$("auth-signin").addEventListener("click", () => authApi.signIn().catch(e => toast("Sign-in failed", true)));
+$("auth-signout").addEventListener("click", () => authApi.signOut());
+
+$("pick-file").addEventListener("click", () => $("seed-file").click());
+$("seed-file").addEventListener("change", async e => {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  try {
+    const buf = await file.arrayBuffer();
+    const wb = XLSX.read(new Uint8Array(buf), { type: "array" });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
+    parsed = rows.map(normalizeRow).filter(r => r);
+    if (!parsed.length) return toast("No brothers found in file", true);
+    showPreview(parsed);
+  } catch (err) {
+    console.error(err);
+    toast("Could not read file", true);
+  }
+});
+
+function normalizeRow(row) {
+  const get = (...names) => {
+    for (const wanted of names) {
+      for (const k of Object.keys(row)) {
+        if (k.replace(/\s+/g,"").toLowerCase() === wanted.replace(/\s+/g,"").toLowerCase())
+          return String(row[k] == null ? "" : row[k]).trim();
+      }
+    }
+    return "";
+  };
+  let first = get("First Name","firstname","first","fname","given name");
+  let last  = get("Last Name","lastname","last","lname","surname","family name");
+  if (!first && !last) {
+    const full = get("Name","Full Name","fullname");
+    if (full) { const p = full.split(/\s+/); first = p[0]; last = p.slice(1).join(" "); }
+  }
+  if (!first || !last) return null;
+  return {
+    firstName: first, lastName: last,
+    status: get("Status") || "Active",
+    email: get("Email","E-mail","Email Address"),
+  };
+}
+
+function showPreview(brothers) {
+  $("preview-box").style.display = "block";
+  $("preview-summary").innerHTML =
+    `<div style="font-family:Georgia,serif; font-size:16px;"><strong style="color:var(--garnet);">${brothers.length}</strong> brothers ready to upload</div>`;
+  $("preview-rows").innerHTML = brothers.map(b =>
+    `<div style="padding:8px 14px; border-bottom:1px solid var(--light-gold); font-family:Georgia,serif; font-size:13px; display:flex; justify-content:space-between;">
+       <span>${b.firstName} ${b.lastName}</span>
+       <span style="font-family:Arial; font-size:9px; letter-spacing:1px; text-transform:uppercase; color:var(--true-gold);">${b.status}</span>
+     </div>`).join("");
+}
+
+$("cancel-btn").addEventListener("click", () => {
+  parsed = null;
+  $("preview-box").style.display = "none";
+  $("seed-file").value = "";
+});
+
+$("push-btn").addEventListener("click", async () => {
+  if (!parsed) return;
+  if (!authApi.current()) return toast("Sign in first", true);
+  $("push-btn").disabled = true;
+  $("push-btn").textContent = "Pushing...";
+  try {
+    await roster.bulkReplace(parsed);
+    $("result-box").innerHTML =
+      `<div class="notice"><strong>Done!</strong> ${parsed.length} brothers pushed to Firestore. <a href="index.html" style="color:var(--garnet); font-weight:bold;">Open the app →</a></div>`;
+    $("preview-box").style.display = "none";
+    toast("Roster seeded");
+  } catch (err) {
+    console.error(err);
+    toast("Push failed — check Firestore rules and your exec email", true);
+  } finally {
+    $("push-btn").disabled = false;
+    $("push-btn").textContent = "Push to Firestore";
+  }
+});
+</script>
+</body>
+</html>

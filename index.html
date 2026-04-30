@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PIKE Event Check-In</title>
+
+<link rel="stylesheet" href="assets/styles.css">
+
+<!-- External libraries: QR code generator + Excel export -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+</head>
+<body>
+
+<div class="wrap">
+
+  <!-- ============== AUTH BAR ============== -->
+  <div class="auth-bar">
+    <span id="auth-status">Not signed in</span>
+    <button id="auth-signin">Exec Sign In</button>
+    <button id="auth-signout" style="display:none;">Sign Out</button>
+  </div>
+
+  <!-- ============== HEADER ============== -->
+  <header>
+    <img class="coa-watermark" src="assets/coat-of-arms.jpg" alt="">
+    <div class="header-content">
+      <img class="pike-logo" src="assets/pike-wordmark.png" alt="PIKE">
+      <div class="tagline">Courage to be more</div>
+      <div class="subtitle">Event Check-In</div>
+      <div class="chapter-tag">Chapter Attendance Tracker</div>
+    </div>
+  </header>
+
+  <!-- ============== TABS ============== -->
+  <div class="tabs">
+    <button class="tab active" data-tab="checkin">Check In</button>
+    <button class="tab" data-tab="events">Events</button>
+    <button class="tab" data-tab="attendance">Attendance</button>
+    <button class="tab" data-tab="roster">Roster</button>
+  </div>
+
+  <!-- ============== CHECK-IN PANEL ============== -->
+  <div class="panel active" id="panel-checkin">
+    <div class="card">
+      <div class="card-title">Brother Check-In</div>
+      <div class="card-sub">Sign in to log your attendance</div>
+
+      <div id="no-events-msg" class="notice" style="display:none;">
+        <strong>No events available.</strong> Ask exec to create one in the Events tab.
+      </div>
+
+      <div id="checkin-form">
+        <label for="ci-event">Select Event</label>
+        <select id="ci-event"></select>
+
+        <label for="ci-name">Find Your Name</label>
+        <div class="brother-search">
+          <input type="text" id="ci-name" placeholder="Start typing your name..." autocomplete="off">
+          <button class="clear-btn" id="ci-clear" type="button">&times;</button>
+          <div class="suggestions" id="ci-suggestions"></div>
+        </div>
+        <div class="help">Type at least 2 characters to search the chapter roster</div>
+
+        <div class="selected-brother" id="ci-selected">
+          <div>
+            <div class="name" id="ci-selected-name"></div>
+            <div class="status" id="ci-selected-status"></div>
+          </div>
+          <button class="btn btn-ghost btn-small" type="button" id="ci-deselect">Change</button>
+        </div>
+
+        <button class="btn" id="ci-submit" disabled>Check In</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============== EVENTS PANEL ============== -->
+  <div class="panel" id="panel-events">
+    <div class="exec-notice">
+      <strong>Exec only.</strong> Sign in with your chapter Google account to create or delete events.
+    </div>
+
+    <div class="card exec-only">
+      <div class="card-title">Create Event</div>
+      <div class="card-sub">All events except chapter meetings</div>
+
+      <div class="notice">
+        <strong>Note:</strong> Chapter meetings are intentionally excluded. Track philanthropy, social, recruitment, brotherhood, leadership, service, alumni, and athletic events here.
+      </div>
+
+      <div class="row-2">
+        <div>
+          <label for="ev-name">Event Name</label>
+          <input type="text" id="ev-name" placeholder="Fireman's Challenge 5K">
+        </div>
+        <div>
+          <label for="ev-type">Event Type</label>
+          <select id="ev-type">
+            <option value="Philanthropy">Philanthropy</option>
+            <option value="Recruitment">Recruitment</option>
+            <option value="Social">Social</option>
+            <option value="Brotherhood">Brotherhood</option>
+            <option value="Leadership">Leadership / PIKE U</option>
+            <option value="Service">Community Service</option>
+            <option value="Alumni">Alumni</option>
+            <option value="Athletic">Intramural / Athletic</option>
+            <option value="Other">Other</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="row-2">
+        <div>
+          <label for="ev-date">Date</label>
+          <input type="date" id="ev-date">
+        </div>
+        <div>
+          <label for="ev-location">Location</label>
+          <input type="text" id="ev-location" placeholder="Memorial HQ Lawn">
+        </div>
+      </div>
+
+      <button class="btn" id="ev-create">Create Event</button>
+    </div>
+
+    <div class="card">
+      <div class="card-title">All Events</div>
+      <div class="card-sub">Show QR for quick check-in &middot; exec can delete to remove an event and its check-ins</div>
+      <div class="event-list" id="event-list"></div>
+    </div>
+  </div>
+
+  <!-- ============== ATTENDANCE PANEL ============== -->
+  <div class="panel" id="panel-attendance">
+    <div class="stats">
+      <div class="stat"><div class="stat-num" id="stat-events">0</div><div class="stat-label">Events</div></div>
+      <div class="stat"><div class="stat-num" id="stat-checkins">0</div><div class="stat-label">Check-Ins</div></div>
+      <div class="stat"><div class="stat-num" id="stat-brothers">0</div><div class="stat-label">Unique Brothers</div></div>
+      <div class="stat"><div class="stat-num" id="stat-participation">0%</div><div class="stat-label">Roster Reached</div></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Attendance Log</div>
+      <div class="card-sub">Every check-in across all events &middot; live-synced</div>
+
+      <div class="toolbar">
+        <div class="filter-group">
+          <label for="filter-event">Filter:</label>
+          <select id="filter-event">
+            <option value="">All events</option>
+          </select>
+        </div>
+        <div class="actions">
+          <button class="btn btn-ghost btn-small" id="export-xlsx">Export Excel</button>
+          <button class="btn btn-ghost btn-small" id="export-csv">Export CSV</button>
+        </div>
+      </div>
+
+      <div id="attendance-table-wrap"></div>
+    </div>
+  </div>
+
+  <!-- ============== ROSTER PANEL ============== -->
+  <div class="panel" id="panel-roster">
+    <div class="exec-notice">
+      <strong>Exec only.</strong> Sign in to add, remove, or import brothers. Brothers checking in can already see and search the full roster.
+    </div>
+
+    <div class="card">
+      <div class="card-title">Chapter Roster</div>
+      <div class="card-sub">Per-brother attendance performance across tracked events</div>
+
+      <div class="add-brother exec-only">
+        <div class="add-brother-title">Add a Brother</div>
+        <div class="add-brother-row">
+          <div>
+            <label for="ab-first">First Name</label>
+            <input type="text" id="ab-first" placeholder="John">
+          </div>
+          <div>
+            <label for="ab-last">Last Name</label>
+            <input type="text" id="ab-last" placeholder="Smith">
+          </div>
+          <div>
+            <label for="ab-status">Status</label>
+            <select id="ab-status">
+              <option value="Active">Active</option>
+              <option value="New Member" selected>New Member</option>
+              <option value="Alumni">Alumni</option>
+              <option value="Inactive">Inactive</option>
+            </select>
+          </div>
+          <div>
+            <label for="ab-email">Email <span style="font-weight:normal; color:var(--true-gold); text-transform:none; letter-spacing:0;">(optional)</span></label>
+            <input type="email" id="ab-email" placeholder="brother@example.com">
+          </div>
+          <button class="btn" id="ab-add" type="button">+ Add</button>
+        </div>
+        <div style="margin-top: 12px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding-top: 12px; border-top: 1px dashed rgba(170,151,103,0.4);">
+          <span style="font-family: Georgia, serif; font-size: 12px; font-style: italic; color: var(--slate);">
+            Got a CSV or Excel file? Bulk-import the whole roster:
+          </span>
+          <button class="btn btn-ghost btn-small" id="import-roster-btn" type="button">Import Roster</button>
+          <input type="file" id="import-file" accept=".csv,.xlsx,.xls" style="display:none;">
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <div class="filter-group">
+          <input type="text" id="roster-search" placeholder="Search roster..." style="width: 220px;">
+          <select id="roster-sort" style="font-size: 12px;">
+            <option value="name">Sort: Name (A-Z)</option>
+            <option value="count-desc">Sort: Most events</option>
+            <option value="count-asc">Sort: Fewest events</option>
+          </select>
+        </div>
+        <div class="filter-group">
+          <span style="font-family: Georgia, serif; font-style: italic; color: var(--true-gold); font-size: 13px;">
+            <span id="roster-total">0</span> brothers
+          </span>
+        </div>
+      </div>
+      <div id="roster-loading" class="empty" style="grid-column: span 2;">Loading roster…</div>
+      <div class="roster-grid" id="roster-grid"></div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ============== IMPORT MODAL ============== -->
+<div class="modal-backdrop" id="import-modal">
+  <div class="modal" style="max-width: 560px;">
+    <button class="modal-close" id="import-modal-close">&times;</button>
+    <h3>Import Roster</h3>
+    <div class="modal-sub">Preview and choose import mode</div>
+
+    <div id="import-summary" style="text-align: left; margin-bottom: 16px;"></div>
+    <div id="import-preview" style="max-height: 220px; overflow-y: auto; text-align: left; border: 1px solid var(--light-gold); margin-bottom: 18px;"></div>
+
+    <div style="display: flex; gap: 10px; flex-wrap: wrap; justify-content: center;">
+      <button class="btn btn-ghost btn-small" id="import-merge" type="button">Merge (recommended)</button>
+      <button class="btn btn-danger btn-small" id="import-replace" type="button">Replace All</button>
+      <button class="btn btn-ghost btn-small" id="import-cancel" type="button">Cancel</button>
+    </div>
+    <div style="margin-top: 14px; font-family: Georgia, serif; font-size: 11px; font-style: italic; color: var(--true-gold); text-align: left;">
+      <strong style="color: var(--garnet); font-style: normal;">Merge:</strong> add new brothers, update existing ones (matched by name), keep all others.<br>
+      <strong style="color: var(--burgundy); font-style: normal;">Replace All:</strong> wipe the current roster and use only what's in the file.
+    </div>
+  </div>
+</div>
+
+<!-- ============== QR MODAL ============== -->
+<div class="modal-backdrop" id="qr-modal">
+  <div class="modal">
+    <button class="modal-close" id="qr-modal-close">&times;</button>
+    <h3>Event Check-In QR</h3>
+    <div class="modal-sub">Scan to check in</div>
+
+    <div class="qr-event-name" id="qr-event-name"></div>
+    <div class="qr-event-meta" id="qr-event-meta"></div>
+    <div class="qr-holder" id="qr-holder"></div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost btn-small" id="qr-download">Download PNG</button>
+      <button class="btn btn-ghost btn-small" id="qr-copy-url">Copy URL</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<!-- App as ES module so it can import Firebase + data layer -->
+<script type="module" src="js/app.js"></script>
+</body>
+</html>

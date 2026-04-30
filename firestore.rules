@@ -1,0 +1,61 @@
+rules_version = '2';
+
+// =====================================================================
+// PIKE Attendance — Firestore Security Rules
+// ---------------------------------------------------------------------
+// Brothers checking in DO NOT need to sign in.
+// Exec members signing in via Google must be on the allowlist below.
+// =====================================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---- Helper: is this signed-in user on the exec allowlist? ----
+    // Edit the email list to match your chapter's officers.
+    function isExec() {
+      return request.auth != null
+          && request.auth.token.email in [
+               'president@yourchapter.org',
+               'vp@yourchapter.org',
+               'recruitment@yourchapter.org',
+               'treasurer@yourchapter.org'
+               // Add or remove emails as your exec board changes.
+             ];
+    }
+
+    // ---- Events ----
+    // Anyone (including unauthenticated brothers checking in) can READ
+    // events so the dropdown populates. Only exec can create/edit/delete.
+    match /events/{eventId} {
+      allow read:   if true;
+      allow create, update, delete: if isExec();
+    }
+
+    // ---- Roster ----
+    // Anyone can READ so the check-in autocomplete works.
+    // Only exec can add, edit, or remove brothers.
+    match /roster/{brotherKey} {
+      allow read:   if true;
+      allow create, update, delete: if isExec();
+    }
+
+    // ---- Check-ins ----
+    // Anyone can CREATE a check-in (so brothers can sign in).
+    // Anyone can READ (so the form can show "X brothers checked in").
+    // Only exec can DELETE or UPDATE check-ins.
+    match /checkins/{checkinId} {
+      allow read:   if true;
+      allow create: if request.resource.data.keys().hasAll(
+                          ['eventId', 'brotherKey', 'name', 'timestamp']
+                        )
+                     && request.resource.data.name is string
+                     && request.resource.data.eventId is string;
+      allow update, delete: if isExec();
+    }
+
+    // Default: deny everything else.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
