@@ -640,3 +640,23 @@ td.status-cell {
   .add-brother-row { grid-template-columns: 1fr 1fr; }
   .add-brother-row .btn { grid-column: span 2; height: auto; padding: 11px 16px; }
 }
+.app-link-bar {
+  display: flex;
+  justify-content: center;
+  gap: 14px;
+  margin-bottom: 22px;
+  font-family: Arial, sans-serif;
+  font-size: 11px;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+}
+.app-link-bar a {
+  text-decoration: none;
+  color: var(--true-gold);
+  padding: 4px 10px;
+  border: 1px solid transparent;
+  transition: all 0.15s;
+}
+.app-link-bar a:hover { color: var(--garnet); border-color: var(--garnet); }
+.app-link-bar a.current { color: var(--garnet); border-color: var(--garnet); }
+.app-link-bar a.current::before { content: "▸ "; }
