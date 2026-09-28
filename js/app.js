@@ -1,107 +1,258 @@
 // ===================================================================
-// PIKE Attendance — Main App
+// PIKE Meeting Tracker — Main App  (Stage 2)
+// ===================================================================
+// Stage 2 ships:
+//   - Meetings tab functional: create, list (upcoming + past toggle), QR, delete
+//   - Roll Call tab functional: signed-in brother sees active meeting + scan/tap to mark present
+//   - Bylaw enforcement: 4 mandatory meetings/quarter cap, 14-day warning
+//   - Per-meeting QR window override (default 5 min after start)
+//   - URL hash routing: #meeting=ID auto-opens Roll Call
+//
+// Stage 1 features preserved: auth, roles, quarter selector, settings, My Standing.
 // ===================================================================
 
-import { authApi, events, roster, checkins } from "./data.js";
+import {
+  authApi, roster, meetings, attendance, absenceRequests,
+  noShows, fines, settings, events, checkins, notifications,
+  EXEC_EMAILS, APPROVER_EMAILS, SGT_AT_ARMS_EMAIL, TREASURER_EMAIL, SECRETARY_EMAIL,
+  PRESIDENT_EMAIL, IVP_EMAIL,
+} from "./data.js";
+import {
+  currentQuarter, formatQuarter, quartersFromRecords,
+} from "./quarters.js";
 
-// ---- App state (mirrors Firestore in memory for fast rendering) ----
+// ---------------- App state ----------------
 const state = {
-  events:   [],
-  roster:   [],
-  checkins: [],
-  user:     null,
+  user: null,
+  roster: [],
+  meetings: [],
+  attendance: [],
+  absenceRequests: [],
+  noShows: [],
+  fines: [],
+  settings: {},
+  events: [],     // Stage 5: from event tracker collection
+  checkins: [],   // Stage 5: from event tracker collection
+  notifications: [],  // Stage 5B: in-app notifications
+  selectedQuarter: currentQuarter(),
+  showPastMeetings: false,
 };
 
-let selectedBrother = null;
-let pendingImport   = null;
-let currentQrEvent  = null;
-let currentQrCanvas = null;
+let currentQrMeeting = null;
+let currentQrCanvas  = null;
+let rollCallTimer    = null;
 
-// ===================================================================
-// UTILITIES
-// ===================================================================
+const $ = id => document.getElementById(id);
+
 function escapeHtml(s) {
   return String(s == null ? "" : s).replace(/[&<>"']/g, ch => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;",
   })[ch]);
 }
 
-function formatDate(d) {
-  if (!d) return "TBD";
-  const [y, m, day] = d.split("-");
-  return `${m}/${day}/${y}`;
-}
-
-function brotherKeyOf(b) {
-  return (b.firstName + "_" + b.lastName).toLowerCase().replace(/[^a-z0-9_]/g, "");
-}
-
 function toast(msg, isError) {
-  const el = document.getElementById("toast");
+  const el = $("toast");
   el.textContent = msg;
   el.classList.toggle("error", !!isError);
   el.classList.add("show");
   setTimeout(() => el.classList.remove("show"), 2600);
 }
 
-const $ = (id) => document.getElementById(id);
+function inQuarter(rec) {
+  if (state.selectedQuarter === "all") return true;
+  return rec.quarter === state.selectedQuarter;
+}
+
+const ROLE_LABELS = {
+  exec: "Exec", sgt: "Sgt-at-Arms", treasurer: "Treasurer",
+  vice_chair: "J-Board Vice Chair", brother: "Brother", guest: "Guest",
+};
+
+// ===================================================================
+// TIME UTILITIES (for meeting QR windows)
+// ===================================================================
+
+// Build a Date object from "YYYY-MM-DD" + "HH:MM" in local time
+function combineLocalDateTime(dateStr, timeStr) {
+  if (!dateStr || !timeStr) return null;
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const [h, mn] = timeStr.split(":").map(Number);
+  return new Date(y, m - 1, d, h, mn, 0, 0);
+}
+
+// QR window: opens 15 min before start, closes (start + windowMinutes)
+function qrWindow(meeting) {
+  const start = combineLocalDateTime(meeting.date, meeting.startTime);
+  if (!start) return { opens: null, closes: null, isOpen: false, isPast: false };
+  const windowMin = Number(meeting.qrWindowMinutes || 5);
+  const opens  = new Date(start.getTime() - 15 * 60 * 1000);
+  const closes = new Date(start.getTime() + windowMin * 60 * 1000);
+  const now    = Date.now();
+  return {
+    opens,
+    closes,
+    start,
+    isOpen: now >= opens.getTime() && now < closes.getTime(),
+    isPast: now >= closes.getTime(),
+    isFuture: now < opens.getTime(),
+  };
+}
+
+function fmtTime(timeStr) {
+  if (!timeStr) return "—";
+  const [h, m] = timeStr.split(":").map(Number);
+  const ampm = h >= 12 ? "PM" : "AM";
+  const hh = h === 0 ? 12 : h > 12 ? h - 12 : h;
+  return `${hh}:${String(m).padStart(2, "0")} ${ampm}`;
+}
+
+function fmtDate(dateStr) {
+  if (!dateStr) return "TBD";
+  const [y, m, d] = dateStr.split("-");
+  return `${m}/${d}/${y}`;
+}
+
+function fmtDateLong(dateStr) {
+  if (!dateStr) return "TBD";
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const date = new Date(y, m - 1, d);
+  return date.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric", year: "numeric" });
+}
+
+// "in 2 hours" / "23 minutes ago" style
+function relativeTime(dateOrTimestamp) {
+  const target = dateOrTimestamp instanceof Date ? dateOrTimestamp.getTime() : dateOrTimestamp;
+  const diff = target - Date.now();
+  const absMin = Math.round(Math.abs(diff) / 60000);
+  if (absMin < 1) return diff > 0 ? "in less than a minute" : "just now";
+  if (absMin < 60) return diff > 0 ? `in ${absMin} min` : `${absMin} min ago`;
+  const absHr = Math.round(absMin / 60);
+  if (absHr < 24) return diff > 0 ? `in ${absHr} hr` : `${absHr} hr ago`;
+  const absDay = Math.round(absHr / 24);
+  return diff > 0 ? `in ${absDay} day${absDay === 1 ? "" : "s"}` : `${absDay} day${absDay === 1 ? "" : "s"} ago`;
+}
 
 // ===================================================================
 // AUTH UI
 // ===================================================================
-authApi.onChange((user) => {
+let _hasShownWelcomePulse = false;
+
+authApi.onChange(user => {
+  const wasSignedIn = !!state.user;
   state.user = user;
-  $("auth-status").innerHTML = user
-    ? `Signed in as <strong>${escapeHtml(user.email)}</strong>`
-    : "Not signed in";
-  $("auth-signin").style.display  = user ? "none" : "";
-  $("auth-signout").style.display = user ? ""    : "none";
-  document.body.classList.toggle("is-exec", !!user);
-  // Re-render to show/hide exec-only controls (delete buttons, create event, etc.)
-  renderEventsList();
-  renderEventsListInChecklist();
-  renderRoster();
-  renderAttendance();
+
+  if (user) {
+    const label = ROLE_LABELS[user.role] || "User";
+    $("auth-status").innerHTML =
+      `<strong>${escapeHtml(user.email)}</strong> <span class="role-pill role-${user.role}">${label}</span>`;
+    $("auth-signin").style.display = "none";
+    $("auth-signout").style.display = "";
+
+    // Welcome pulse — fire once per session on first sign-in
+    if (!wasSignedIn && !_hasShownWelcomePulse) {
+      _hasShownWelcomePulse = true;
+      document.body.classList.add("welcome-pulsing");
+      setTimeout(() => document.body.classList.remove("welcome-pulsing"), 1700);
+    }
+  } else {
+    $("auth-status").innerHTML = "Not signed in";
+    $("auth-signin").style.display = "";
+    $("auth-signout").style.display = "none";
+    _hasShownWelcomePulse = false; // Reset for next sign-in
+  }
+
+  document.body.classList.toggle("is-signed-in", !!user);
+  document.body.classList.toggle("is-exec",      !!(user && user.isExec));
+  document.body.classList.toggle("is-approver",  !!(user && user.isApprover));
+  document.body.classList.toggle("is-sgt",       !!(user && user.isSgt));
+  document.body.classList.toggle("is-treasurer", !!(user && user.isTreasurer));
+  document.body.classList.toggle("is-vice-chair",!!(user && user.isViceChair));
+  document.body.classList.toggle("is-brother",   !!(user && user.rosterEntry));
+  document.body.classList.toggle("is-guest",     !!(user && !user.rosterEntry && !user.isExec));
+
+  renderAll();
 });
 
 $("auth-signin").addEventListener("click", async () => {
-  try {
-    await authApi.signIn();
-    toast("Signed in");
-  } catch (e) {
-    console.error(e);
-    toast("Sign-in failed", true);
-  }
+  try { await authApi.signIn(); toast("Signed in"); }
+  catch (e) { console.error(e); toast("Sign-in failed", true); }
 });
-
 $("auth-signout").addEventListener("click", async () => {
   await authApi.signOut();
   toast("Signed out");
 });
 
 // ===================================================================
-// REAL-TIME SUBSCRIPTIONS
+// SUBSCRIPTIONS
 // ===================================================================
-events.subscribe((list) => {
-  state.events = list;
-  renderEventsList();
-  renderEventsListInChecklist();
-  renderAttendance();
-  renderRoster();
-});
-
-roster.subscribe((list) => {
+roster.subscribe(list => {
   state.roster = list;
-  $("roster-loading").style.display = "none";
-  renderRoster();
-  renderAttendance();
+  renderAll();
+});
+meetings.subscribe(list => {
+  state.meetings = list;
+  renderQuarterSelectors();
+  renderAll();
+});
+attendance.subscribe(list => {
+  state.attendance = list;
+  renderAll();
+});
+absenceRequests.subscribe(list => {
+  state.absenceRequests = list;
+  renderAll();
+});
+noShows.subscribe(list => {
+  state.noShows = list;
+  renderAll();
+});
+fines.subscribe(list => {
+  state.fines = list;
+  updateFineAura(); // Aura must reflect fine state changes immediately
+  renderAll();
+});
+settings.subscribe(s => {
+  state.settings = s;
+  renderSettings();
+});
+events.subscribe(list => {
+  state.events = list;
+  renderAll();
+});
+checkins.subscribe(list => {
+  state.checkins = list;
+  renderAll();
+});
+notifications.subscribe(list => {
+  state.notifications = list;
+  showPendingNotifications();
+  updateFineAura();
+  renderAll();
 });
 
-checkins.subscribe((list) => {
-  state.checkins = list;
-  renderAttendance();
-  renderRoster();
-  renderEventsList();
+// ===================================================================
+// QUARTER SELECTOR
+// ===================================================================
+function renderQuarterSelectors() {
+  const opts = quartersFromRecords(state.meetings, state.attendance, state.noShows, state.fines);
+  const html = ['<option value="all">All quarters</option>'].concat(
+    opts.map(q => `<option value="${q}">${formatQuarter(q)}</option>`)
+  ).join("");
+  document.querySelectorAll(".quarter-select").forEach(sel => {
+    const v = sel.value || state.selectedQuarter;
+    sel.innerHTML = html;
+    sel.value = (opts.includes(v) || v === "all") ? v : state.selectedQuarter;
+  });
+}
+
+document.querySelectorAll(".quarter-select").forEach(sel => {
+  sel.addEventListener("change", e => {
+    state.selectedQuarter = e.target.value;
+    document.querySelectorAll(".quarter-select").forEach(other => {
+      if (other !== e.target) other.value = e.target.value;
+    });
+    renderAll();
+  });
 });
 
 // ===================================================================
@@ -120,616 +271,1119 @@ document.querySelectorAll(".tab").forEach(t => {
 });
 
 // ===================================================================
-// CHECK-IN: brother autocomplete
+// MASTER RENDER
 // ===================================================================
-const ciNameInput     = $("ci-name");
-const ciSuggestions   = $("ci-suggestions");
-const ciSelected      = $("ci-selected");
-const ciSelectedName  = $("ci-selected-name");
-const ciSelectedStat  = $("ci-selected-status");
-const ciClear         = $("ci-clear");
-const ciSubmit        = $("ci-submit");
-
-function renderSuggestions(query) {
-  if (query.length < 2) {
-    ciSuggestions.classList.remove("visible");
-    return;
-  }
-  const q = query.toLowerCase();
-  const matches = state.roster.filter(b => {
-    const full = (b.firstName + " " + b.lastName).toLowerCase();
-    return full.includes(q)
-        || b.lastName.toLowerCase().startsWith(q)
-        || b.firstName.toLowerCase().startsWith(q);
-  }).slice(0, 8);
-
-  if (!matches.length) {
-    ciSuggestions.innerHTML =
-      '<div class="suggestion" style="font-style:italic; color:var(--true-gold); cursor:default;">No matches in roster</div>';
-    ciSuggestions.classList.add("visible");
-    return;
-  }
-  ciSuggestions.innerHTML = matches.map(b =>
-    `<div class="suggestion" data-key="${b.key}">
-       <span>${escapeHtml(b.firstName + " " + b.lastName)}</span>
-       <span class="status-tag">${escapeHtml(b.status)}</span>
-     </div>`
-  ).join("");
-  ciSuggestions.classList.add("visible");
-
-  ciSuggestions.querySelectorAll("[data-key]").forEach(el => {
-    el.addEventListener("click", () => {
-      const b = state.roster.find(x => x.key === el.dataset.key);
-      if (b) selectBrother(b);
-    });
-  });
+function renderAll() {
+  renderMyStanding();
+  renderRollCallTab();
+  renderMeetingsTab();
+  renderAbsenceTab();
+  renderReportsTab();
 }
 
-function selectBrother(b) {
-  selectedBrother = b;
-  ciNameInput.value = b.firstName + " " + b.lastName;
-  ciSelectedName.textContent = b.firstName + " " + b.lastName;
-  ciSelectedStat.textContent = b.status + (b.email ? " • " + b.email : "");
-  ciSelected.classList.add("visible");
-  ciNameInput.style.display = "none";
-  ciSuggestions.classList.remove("visible");
-  ciClear.classList.remove("visible");
-  ciSubmit.disabled = false;
-}
-
-function deselectBrother() {
-  selectedBrother = null;
-  ciNameInput.value = "";
-  ciNameInput.style.display = "block";
-  ciSelected.classList.remove("visible");
-  ciSubmit.disabled = true;
-  ciNameInput.focus();
-}
-
-ciNameInput.addEventListener("input", (e) => {
-  ciClear.classList.toggle("visible", e.target.value.length > 0);
-  renderSuggestions(e.target.value);
-});
-ciNameInput.addEventListener("focus", () => {
-  if (ciNameInput.value.length >= 2) renderSuggestions(ciNameInput.value);
-});
-ciNameInput.addEventListener("blur", () =>
-  setTimeout(() => ciSuggestions.classList.remove("visible"), 200)
-);
-ciClear.addEventListener("click", () => {
-  ciNameInput.value = "";
-  ciClear.classList.remove("visible");
-  ciSuggestions.classList.remove("visible");
-  ciNameInput.focus();
-});
-$("ci-deselect").addEventListener("click", deselectBrother);
-
 // ===================================================================
-// CHECK-IN: dropdown + submit
+// MY STANDING
 // ===================================================================
-function renderEventsListInChecklist(preselectId) {
-  const sel  = $("ci-event");
-  const msg  = $("no-events-msg");
-  const form = $("checkin-form");
-  if (!state.events.length) {
-    msg.style.display = "block";
-    form.style.display = "none";
+function renderMyStanding() {
+  const card = $("standing-card");
+  const guestCard = $("standing-guest");
+
+  if (!state.user) {
+    card.style.display = "none";
+    guestCard.style.display = "";
+    guestCard.innerHTML = `
+      <div class="card-title">Sign in to view your standing</div>
+      <div class="card-sub">Brothers and exec use the same Google sign-in</div>
+      <p style="font-family: Georgia, serif; font-size: 14px; line-height: 1.6;">
+        Click <strong>Sign In with Google</strong> at the top of the page.
+        Use the Gmail address the chapter has on file for you.
+      </p>`;
     return;
   }
-  msg.style.display = "none";
-  form.style.display = "block";
-  sel.innerHTML = state.events.map(ev =>
-    `<option value="${ev.id}">${escapeHtml(ev.name)} • ${formatDate(ev.date)} • ${escapeHtml(ev.type)}</option>`
-  ).join("");
-  if (preselectId && state.events.some(e => e.id === preselectId)) {
-    sel.value = preselectId;
-  }
-}
 
-ciSubmit.addEventListener("click", async () => {
-  const eventId = $("ci-event").value;
-  if (!eventId) return toast("Pick an event", true);
-  if (!selectedBrother) return toast("Select your name from the roster", true);
-
-  const dup = state.checkins.find(c =>
-    c.eventId === eventId && c.brotherKey === selectedBrother.key
-  );
-  if (dup) return toast("You already checked in to this event", true);
-
-  try {
-    await checkins.create({
-      eventId,
-      brotherKey: selectedBrother.key,
-      name:       selectedBrother.firstName + " " + selectedBrother.lastName,
-      status:     selectedBrother.status,
-      email:      selectedBrother.email,
-    });
-    deselectBrother();
-    toast("Checked in — thanks, brother!");
-  } catch (e) {
-    console.error(e);
-    toast("Could not save — check connection", true);
-  }
-});
-
-// ===================================================================
-// EVENTS PANEL
-// ===================================================================
-$("ev-create").addEventListener("click", async () => {
-  if (!state.user) return toast("Sign in as exec to create events", true);
-
-  const name     = $("ev-name").value.trim();
-  const type     = $("ev-type").value;
-  const date     = $("ev-date").value;
-  const location = $("ev-location").value.trim();
-  if (!name) return toast("Event name is required", true);
-  if (!date) return toast("Event date is required", true);
-  if (/chapter\s*meeting/i.test(name))
-    return toast("Chapter meetings are not tracked here", true);
-
-  try {
-    await events.create({ name, type, date, location });
-    $("ev-name").value     = "";
-    $("ev-location").value = "";
-    $("ev-date").valueAsDate = new Date();
-    toast("Event created");
-  } catch (e) {
-    console.error(e);
-    toast("Permission denied — are you signed in as exec?", true);
-  }
-});
-
-function renderEventsList() {
-  const list = $("event-list");
-  if (!state.events.length) {
-    list.innerHTML = '<div class="empty">No events yet — create one above.</div>';
+  if (!state.user.rosterEntry && !state.user.isExec) {
+    card.style.display = "none";
+    guestCard.style.display = "";
+    guestCard.innerHTML = `
+      <div class="card-title">Signed in as guest</div>
+      <div class="card-sub">${escapeHtml(state.user.email)}</div>
+      <p style="font-family: Georgia, serif; font-size: 14px; line-height: 1.6;">
+        You're signed in but your email isn't matched to anyone in the chapter roster.
+        Ask any exec officer to update your roster entry's email to
+        <code>${escapeHtml(state.user.email)}</code> in the
+        <a href="https://uclapikes-hub.github.io/pike-attendance/" target="_blank" rel="noopener" style="color: var(--garnet); font-weight: bold;">event tracker's Roster tab</a>.
+      </p>`;
     return;
   }
-  list.innerHTML = state.events.map(ev => {
-    const count = state.checkins.filter(c => c.eventId === ev.id).length;
-    const canEdit = !!state.user;
-    return `<div class="event-row">
-      <div class="event-info">
-        <div class="event-name">${escapeHtml(ev.name)}</div>
-        <div class="event-meta">
-          <span class="badge">${escapeHtml(ev.type)}</span>
-          ${formatDate(ev.date)}${ev.location ? " • " + escapeHtml(ev.location) : ""}
-        </div>
+
+  guestCard.style.display = "none";
+  card.style.display = "";
+
+  const target = state.user.rosterEntry;
+  const fullName = target ? `${target.firstName} ${target.lastName}` : state.user.email;
+  const myAttendance  = target ? state.attendance.filter(a => a.brotherKey === target.key && inQuarter(a)) : [];
+  const myAbsenceReqs = target ? state.absenceRequests.filter(r => r.brotherKey === target.key && inQuarter(r)) : [];
+  const myNoShows     = target ? state.noShows.filter(n => n.brotherKey === target.key && inQuarter(n)) : [];
+  const myFines       = target ? state.fines.filter(f => f.brotherKey === target.key && inQuarter(f) && f.status === "pending") : [];
+  const fineTotal     = myFines.reduce((sum, f) => sum + (Number(f.amount) || 0), 0);
+
+  const approved = myAbsenceReqs.filter(r => r.status === "approved").length;
+  const pending  = myAbsenceReqs.filter(r => r.status === "pending").length;
+  const remainingAbsences = Math.max(0, 3 - approved);
+  const meetingsThisQuarter = state.meetings.filter(inQuarter).length;
+
+  const standingClass = (myNoShows.length >= 3) ? "judicial"
+                       : (myNoShows.length === 2) ? "danger"
+                       : (myNoShows.length === 1) ? "warn" : "";
+  const standingLabel = (myNoShows.length >= 3) ? "Judicial Review" :
+                        (myNoShows.length === 2) ? "Fine + Sgt Notice" :
+                        (myNoShows.length === 1) ? "Warning" : "Good Standing";
+
+  card.className = `card ${standingClass}`;
+  card.innerHTML = `
+    <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:14px;">
+      <div>
+        <div class="card-title">Welcome, ${escapeHtml(fullName)}</div>
+        <div class="card-sub">${escapeHtml(target?.status || ROLE_LABELS[state.user.role])} &middot; ${formatQuarter(state.selectedQuarter)}</div>
       </div>
-      <div class="event-actions">
-        <span class="count-pill">${count} ${count === 1 ? "check-in" : "check-ins"}</span>
-        <button class="btn btn-ghost btn-small" data-qr="${ev.id}">QR</button>
-        ${canEdit ? `<button class="btn btn-danger btn-small" data-del="${ev.id}">Delete</button>` : ""}
+    </div>
+
+    <div class="standing-grid">
+      <div class="standing-tile absences">
+        <div class="num">${approved}/3</div>
+        <div class="label">Free Absences Used</div>
+        <div class="sub">${remainingAbsences} remaining</div>
+      </div>
+      <div class="standing-tile no-shows">
+        <div class="num">${myNoShows.length}</div>
+        <div class="label">No-Shows</div>
+        <div class="sub">${myNoShows.length === 0 ? "Clean record" : standingLabel}</div>
+      </div>
+      <div class="standing-tile fines">
+        <div class="num">$${fineTotal}</div>
+        <div class="label">Outstanding Fines</div>
+        <div class="sub">${myFines.length === 0 ? "None" : "Pay treasurer"}</div>
+      </div>
+      <div class="standing-tile standing">
+        <div class="num" style="font-size: 22px; padding-top: 8px;">${standingLabel}</div>
+        <div class="label">This Quarter</div>
+        <div class="sub">${myAttendance.length} of ${meetingsThisQuarter} meetings attended</div>
+      </div>
+    </div>
+
+    ${pending > 0 ? `
+      <div class="role-notice" style="margin-top: 18px;">
+        <strong>${pending} absence request${pending === 1 ? "" : "s"} pending review.</strong>
+        Approvers (President / IVP / Secretary) will review before each meeting.
+      </div>` : ""}
+
+    ${myNoShows.length > 0 ? renderMyNoShowsList(myNoShows, myFines) : ""}
+  `;
+
+  // Wire up Appeal buttons
+  card.querySelectorAll("[data-appeal]").forEach(b =>
+    b.addEventListener("click", () => openAppealModal(b.dataset.appeal)));
+}
+
+function renderMyNoShowsList(myNoShows, myFines) {
+  const sorted = [...myNoShows].sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+  const fineByMeeting = new Map(myFines.map(f => [f.meetingId, f]));
+  return `
+    <div style="margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--light-gold);">
+      <div style="font-family: 'Cormorant Garamond', Georgia, serif; font-size: 18px; font-weight: 600; color: var(--garnet); margin-bottom: 10px;">
+        Your No-Shows This Quarter
+      </div>
+      <div style="display: flex; flex-direction: column; gap: 8px;">
+        ${sorted.map((n, idx) => {
+          const fine = fineByMeeting.get(n.meetingId);
+          const sequence = ["1st", "2nd", "3rd", "4th+"][Math.min(n.count - 1, 3)] || "";
+          const consequenceLabel =
+            n.count === 1 ? "Warning" :
+            n.count === 2 ? `$${fine?.amount || 25} Fine + Sgt notice` :
+            n.count >= 3  ? "Sgt-at-Arms / Judicial Board" : "";
+
+          let appealStatus = "";
+          if (n.appealed) {
+            appealStatus = n.appealStatus === "pending" ? "Appeal pending" :
+                          n.appealStatus === "overturned" ? "✓ Overturned" :
+                          n.appealStatus === "upheld" ? "Appeal denied" : "";
+          }
+
+          return `
+            <div style="padding: 12px 14px; background: white; border: 1px solid rgba(170,151,103,0.3); border-left: 3px solid var(--crimson); display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; align-items: flex-start;">
+              <div style="flex: 1; min-width: 200px;">
+                <div style="font-family: Arial, sans-serif; font-size: 11px; font-weight: bold; letter-spacing: 1px; color: var(--crimson); text-transform: uppercase;">
+                  ${sequence} No-Show &middot; ${escapeHtml(consequenceLabel)}
+                </div>
+                <div style="font-family: Georgia, serif; font-size: 13px; color: var(--slate); margin-top: 4px;">
+                  ${escapeHtml(n.meetingTitle || "Meeting")} &middot; ${escapeHtml(fmtDate(n.meetingDate || ""))}
+                </div>
+                ${n.reason ? `<div style="font-family: Georgia, serif; font-size: 11px; color: var(--knight-steel); margin-top: 3px; font-style: italic;">${escapeHtml(noShowReasonLabel(n.reason))}</div>` : ""}
+                ${n.appealed && n.appealStatus !== "pending" && n.appealResolverNote ? `
+                  <div style="margin-top: 6px; padding: 6px 10px; background: var(--light-gold); font-family: Georgia, serif; font-size: 11px; font-style: italic;">
+                    <strong style="font-style: normal; color: var(--garnet);">Sgt note:</strong> ${escapeHtml(n.appealResolverNote)}
+                  </div>` : ""}
+              </div>
+              <div style="display: flex; flex-direction: column; gap: 6px; align-items: flex-end;">
+                ${appealStatus ? `
+                  <span style="background: ${n.appealStatus === "overturned" ? "var(--garnet)" : "var(--knight-steel)"}; color: white; padding: 3px 8px; font-family: Arial; font-size: 9px; font-weight: bold; letter-spacing: 1.5px;">
+                    ${escapeHtml(appealStatus)}
+                  </span>
+                ` : ""}
+                ${!n.appealed ? `<button class="btn btn-ghost btn-small" data-appeal="${n.id}">Appeal</button>` : ""}
+              </div>
+            </div>`;
+        }).join("")}
       </div>
     </div>`;
-  }).join("");
-
-  list.querySelectorAll("[data-del]").forEach(b =>
-    b.addEventListener("click", () => deleteEvent(b.dataset.del))
-  );
-  list.querySelectorAll("[data-qr]").forEach(b =>
-    b.addEventListener("click", () => openQrModal(b.dataset.qr))
-  );
 }
 
-async function deleteEvent(id) {
-  const ev = state.events.find(e => e.id === id);
-  if (!ev) return;
-  const cnt = state.checkins.filter(c => c.eventId === id).length;
-  const msg = cnt > 0
-    ? `Delete "${ev.name}" and its ${cnt} check-in${cnt === 1 ? "" : "s"}? This cannot be undone.`
-    : `Delete "${ev.name}"?`;
-  if (!confirm(msg)) return;
-  try {
-    await events.remove(id);
-    toast("Event deleted");
-  } catch (e) {
-    console.error(e);
-    toast("Permission denied", true);
-  }
+function noShowReasonLabel(reason) {
+  const labels = {
+    no_qr_scan:        "Did not scan QR",
+    denied_request:    "Absence request denied",
+    pending_at_start:  "Absence request not decided in time",
+  };
+  return labels[reason] || reason;
 }
 
 // ===================================================================
-// ATTENDANCE PANEL
+// ROLL CALL TAB  (Stage 2)
 // ===================================================================
-function renderAttendance() {
-  $("stat-events").textContent   = state.events.length;
-  $("stat-checkins").textContent = state.checkins.length;
-  const uniq = new Set(state.checkins.map(c => c.brotherKey || c.name.toLowerCase()));
-  $("stat-brothers").textContent = uniq.size;
-  const pct = state.roster.length ? Math.round((uniq.size / state.roster.length) * 100) : 0;
-  $("stat-participation").textContent = pct + "%";
+function renderRollCallTab() {
+  const placeholder = $("roll-call-placeholder");
+  if (!placeholder) return;
 
-  const filterSel = $("filter-event");
-  const current = filterSel.value;
-  filterSel.innerHTML = '<option value="">All events</option>' +
-    state.events.map(ev => `<option value="${ev.id}">${escapeHtml(ev.name)}</option>`).join("");
-  filterSel.value = current;
+  // Find any meeting whose QR window is currently open
+  const openNow = state.meetings.find(m => qrWindow(m).isOpen);
+  // Find the next upcoming meeting (window not yet open)
+  const upcoming = state.meetings
+    .filter(m => qrWindow(m).isFuture)
+    .sort((a, b) => qrWindow(a).start.getTime() - qrWindow(b).start.getTime())[0];
 
-  const filterId = filterSel.value;
-  const rows = state.checkins.filter(c => !filterId || c.eventId === filterId);
+  // If a brother is signed-in and there's a meeting with an open window, that's the action surface
+  if (openNow && state.user && state.user.rosterEntry) {
+    const target = state.user.rosterEntry;
+    const w = qrWindow(openNow);
+    const alreadyMarked = state.attendance.some(a =>
+      a.meetingId === openNow.id && a.brotherKey === target.key
+    );
+    const closesIn = relativeTime(w.closes);
 
-  const wrap = $("attendance-table-wrap");
-  if (!rows.length) {
-    wrap.innerHTML = '<div class="empty">No check-ins yet.</div>';
+    placeholder.innerHTML = `
+      <div class="card warn" style="text-align: center;">
+        <div class="card-sub" style="color: var(--crimson);">Roll Call Open</div>
+        <div class="card-title" style="color: var(--crimson); font-size: 28px;">${escapeHtml(openNow.title)}</div>
+        <div style="font-family: Georgia, serif; font-size: 14px; color: var(--slate); margin-top: 6px;">
+          ${escapeHtml(fmtDateLong(openNow.date))} &middot; ${fmtTime(openNow.startTime)}${openNow.location ? " &middot; " + escapeHtml(openNow.location) : ""}
+        </div>
+        <div style="font-family: Arial, sans-serif; font-size: 11px; letter-spacing: 1.5px; text-transform: uppercase; color: var(--true-gold); margin-top: 14px; font-weight: bold;">
+          Window closes ${closesIn}
+        </div>
+
+        ${alreadyMarked ? `
+          <div style="margin-top: 24px; padding: 18px; background: var(--light-gold); border-left: 3px solid var(--garnet);">
+            <div style="font-family: 'Cormorant Garamond', Georgia, serif; font-size: 22px; color: var(--garnet); font-weight: 600;">
+              ✓ You're checked in
+            </div>
+            <div style="font-family: Georgia, serif; font-size: 13px; color: var(--slate); margin-top: 6px;">
+              Marked present at ${new Date(state.attendance.find(a => a.meetingId === openNow.id && a.brotherKey === target.key)?.timestamp).toLocaleTimeString([], {hour: 'numeric', minute: '2-digit'})}
+            </div>
+          </div>
+        ` : `
+          <button class="btn" id="rc-mark-present" style="margin-top: 24px; font-size: 14px; padding: 16px 36px;">
+            Mark Me Present
+          </button>
+          ${openNow.mandatory ? `<div style="margin-top: 14px; font-family: Georgia, serif; font-size: 12px; font-style: italic; color: var(--burgundy);">⚑ Mandatory meeting — bylaws require attendance</div>` : ""}
+        `}
+      </div>
+    `;
+
+    if (!alreadyMarked) {
+      $("rc-mark-present").addEventListener("click", async () => {
+        try {
+          await attendance.markPresent({
+            meetingId:  openNow.id,
+            brotherKey: target.key,
+            name:       `${target.firstName} ${target.lastName}`,
+            email:      target.email,
+            quarter:    openNow.quarter,
+          });
+          toast("Marked present — thanks, brother!");
+        } catch (e) {
+          console.error(e);
+          toast("Could not mark present — check connection", true);
+        }
+      });
+    }
     return;
   }
-  const canEdit = !!state.user;
-  wrap.innerHTML = `<table>
-    <thead><tr>
-      <th>Brother</th><th>Status</th><th>Event</th><th>Type</th><th>Checked In</th>
-      ${canEdit ? "<th></th>" : ""}
-    </tr></thead>
-    <tbody>${rows.map(c => {
-      const ev = state.events.find(e => e.id === c.eventId);
-      return `<tr>
-        <td>${escapeHtml(c.name)}</td>
-        <td class="status-cell">${escapeHtml(c.status || "")}</td>
-        <td>${ev ? escapeHtml(ev.name) : "<em>deleted</em>"}</td>
-        <td>${ev ? escapeHtml(ev.type) : "—"}</td>
-        <td>${new Date(c.timestamp).toLocaleString()}</td>
-        ${canEdit ? `<td><button class="btn btn-danger btn-small" data-del-ci="${c.id}">×</button></td>` : ""}
-      </tr>`;
-    }).join("")}</tbody>
-  </table>`;
 
-  wrap.querySelectorAll("[data-del-ci]").forEach(b =>
-    b.addEventListener("click", async () => {
-      if (!confirm("Delete this check-in?")) return;
-      try {
-        await checkins.remove(b.dataset.delCi);
-        toast("Check-in deleted");
+  // Brother signed in but no open window
+  if (state.user && state.user.rosterEntry) {
+    if (!state.meetings.length) {
+      placeholder.innerHTML = `
+        <div class="card">
+          <div class="empty-coming-soon">
+            <h3>No meetings scheduled yet</h3>
+            <p style="margin-top: 12px;">Check back closer to the next chapter meeting.</p>
+          </div>
+        </div>`;
+      return;
+    }
+
+    if (upcoming) {
+      const w = qrWindow(upcoming);
+      const opensIn = relativeTime(w.opens);
+      placeholder.innerHTML = `
+        <div class="card">
+          <div class="card-sub">Next Meeting</div>
+          <div class="card-title">${escapeHtml(upcoming.title)}</div>
+          <div style="font-family: Georgia, serif; font-size: 14px; color: var(--slate); margin-top: 6px;">
+            ${escapeHtml(fmtDateLong(upcoming.date))} &middot; ${fmtTime(upcoming.startTime)}${upcoming.location ? " &middot; " + escapeHtml(upcoming.location) : ""}
+          </div>
+          <div style="margin-top: 18px; padding: 14px; background: var(--light-gold); border-left: 3px solid var(--true-gold);">
+            <div style="font-family: Arial, sans-serif; font-size: 11px; letter-spacing: 1.5px; text-transform: uppercase; color: var(--garnet); font-weight: bold;">
+              Roll call opens ${opensIn}
+            </div>
+            <div style="font-family: Georgia, serif; font-size: 13px; font-style: italic; color: var(--slate); margin-top: 4px;">
+              The "Mark Me Present" button will appear here automatically when the window opens (15 min before start).
+            </div>
+          </div>
+          ${upcoming.mandatory ? `<div style="margin-top: 12px; font-family: Georgia, serif; font-size: 12px; font-style: italic; color: var(--burgundy);">⚑ Mandatory meeting</div>` : ""}
+        </div>
+      `;
+      return;
+    }
+
+    // Brother but only past meetings
+    placeholder.innerHTML = `
+      <div class="card">
+        <div class="empty-coming-soon">
+          <h3>No upcoming meetings</h3>
+          <p style="margin-top: 12px;">No chapter meetings scheduled at the moment.</p>
+        </div>
+      </div>`;
+    return;
+  }
+
+  // Not signed in or guest
+  placeholder.innerHTML = `
+    <div class="card">
+      <div class="empty-coming-soon">
+        <h3>Sign in to take roll</h3>
+        <p style="margin-top: 12px;">When a chapter meeting is open for roll call, the "Mark Me Present" button will appear here.</p>
+      </div>
+    </div>`;
+}
+
+// Re-render Roll Call every 30 seconds so the window flips when timing changes
+function startRollCallTimer() {
+  if (rollCallTimer) clearInterval(rollCallTimer);
+  rollCallTimer = setInterval(() => {
+    renderRollCallTab();
+    renderMyStanding();
+    renderMeetingsTab();
+    // Stage 4: also run the no-show processor (only fires for exec/sgt)
+    processClosedMeetings().catch(e => console.warn("No-show processor:", e));
+    autoDenyPendingPastStart().catch(e => console.warn("Auto-deny:", e));
+  }, 30000);
+}
+
+// ===================================================================
+// STAGE 4 — NO-SHOW PROCESSING
+// ===================================================================
+//
+// IDEMPOTENT: re-running these functions doesn't create duplicates.
+// Only fires for exec or Sgt-at-Arms (via Firestore rules + UI guard).
+//
+// Two phases run on the 30-second timer:
+//   1. autoDenyPendingPastStart — flips pending requests to "denied"
+//      once their meeting starts (so they correctly become no-shows)
+//   2. processClosedMeetings — for each meeting whose QR window has
+//      closed, generates no_show records for eligible brothers who
+//      didn't scan and don't have an approved absence
+//
+// Auto-creates fine records when a brother's no-show count hits 2.
+// ===================================================================
+
+const FINE_AMOUNT_DEFAULT = 25;
+
+function brotherIsEligible(brother) {
+  // Only Active brothers + New Members are subject to attendance
+  return brother.status === "Active" || brother.status === "New Member";
+}
+
+async function autoDenyPendingPastStart() {
+  if (!state.user || (!state.user.isExec && !state.user.isSgt)) return;
+
+  const now = Date.now();
+  const pending = state.absenceRequests.filter(r => r.status === "pending");
+  if (pending.length === 0) return;
+
+  for (const req of pending) {
+    const meeting = state.meetings.find(m => m.id === req.meetingId);
+    if (!meeting) continue;
+    const start = combineLocalDateTime(meeting.date, meeting.startTime);
+    if (!start || start.getTime() > now) continue;
+
+    // Meeting has started. Auto-deny.
+    try {
+      await absenceRequests.review(req.id, "denied",
+        "Auto-denied: not reviewed before meeting start time.");
+      console.log(`Auto-denied request for ${req.brotherName} / ${req.meetingTitle}`);
+    } catch (e) {
+      console.warn("Auto-deny failed (non-approver?):", e);
+    }
+  }
+}
+
+// Processing lock — prevents the timer from firing the processor while a
+// previous run is still in progress. The cache-based idempotency check below
+// is backed up by a direct Firestore query (noShows.exists) for safety.
+let _processingLock = false;
+
+async function processClosedMeetings() {
+  if (!state.user || (!state.user.isExec && !state.user.isSgt)) return;
+  if (_processingLock) return; // Another run still in progress
+  _processingLock = true;
+
+  try {
+    // Closed meetings = QR window has passed
+    const closedMeetings = state.meetings.filter(m => qrWindow(m).isPast);
+    if (closedMeetings.length === 0) return;
+
+    // Eligible brothers (Active + New Member only)
+    const eligible = state.roster.filter(brotherIsEligible);
+    if (eligible.length === 0) return;
+
+    for (const meeting of closedMeetings) {
+      const meetingId = meeting.id;
+      const meetingQuarter = meeting.quarter;
+
+      // Brothers who scanned for this meeting
+      const present = new Set(
+        state.attendance.filter(a => a.meetingId === meetingId).map(a => a.brotherKey)
+      );
+
+      // Cache-based existing no-shows (fast first pass)
+      const existingNoShows = new Set(
+        state.noShows.filter(n => n.meetingId === meetingId).map(n => n.brotherKey)
+      );
+
+      for (const brother of eligible) {
+        if (present.has(brother.key)) continue;        // Marked present
+        if (existingNoShows.has(brother.key)) continue; // Already in cache
+
+        // Did this brother have an approved absence for this meeting?
+        const myReq = state.absenceRequests.find(r =>
+          r.meetingId === meetingId && r.brotherKey === brother.key
+        );
+        if (myReq && myReq.status === "approved") continue; // Excused
+
+        // STRONG IDEMPOTENCY: direct Firestore query before creating.
+        // This catches the cache-stale window where the subscription
+        // hasn't yet reflected a no_show that's already in the database.
+        const alreadyExists = await noShows.exists(brother.key, meetingId);
+        if (alreadyExists) continue;
+
+        // Determine reason for the no-show record
+        let reason = "no_qr_scan";
+        if (myReq && myReq.status === "denied") {
+          reason = myReq.reviewerNote?.startsWith("Auto-denied")
+            ? "pending_at_start"
+            : "denied_request";
+        }
+
+        // Compute count: how many no-shows does this brother already have THIS QUARTER?
+        const priorCount = state.noShows.filter(n =>
+          n.brotherKey === brother.key &&
+          n.quarter === meetingQuarter &&
+          n.appealStatus !== "overturned"
+        ).length;
+        const newCount = priorCount + 1;
+
+        try {
+          const fullName = `${brother.firstName} ${brother.lastName}`;
+          const noShowDocRef = await noShows.create({
+            brotherKey: brother.key,
+            brotherName: fullName,
+            email: brother.email,
+            meetingId,
+            meetingTitle: meeting.title,
+            meetingDate: meeting.date,
+            reason,
+          count: newCount,
+          quarter: meetingQuarter,
+        });
+        console.log(`No-show recorded: ${brother.firstName} (count: ${newCount})`);
+
+        // 2nd no-show triggers a $25 fine
+        let fineAmount = Number(state.settings.fineAmount) || FINE_AMOUNT_DEFAULT;
+        if (newCount === 2) {
+          // Direct query for strong idempotency on fine creation too
+          const fineExists = await fines.exists(brother.key, meetingId);
+          if (!fineExists) {
+            await fines.create({
+              brotherKey: brother.key,
+              brotherName: fullName,
+              email: brother.email,
+              amount: fineAmount,
+              reason: "2nd no-show",
+              meetingId,
+              meetingTitle: meeting.title,
+              meetingDate: meeting.date,
+              quarter: meetingQuarter,
+            });
+            console.log(`Fine created: $${fineAmount} for ${brother.firstName}`);
+          }
+        }
+
+        // Notify the affected brother
+        const notifData = buildNoShowNotification(fullName, meeting, newCount, fineAmount);
+        await notify(brother.email, "no_show", notifData.title, notifData.message, notifData.severity, noShowDocRef.id);
+
+        // Notify Sgt-at-Arms on 3rd+ no-show
+        if (newCount >= 3) {
+          const sgtEmail = state.settings.sgtAtArmsEmail || SGT_AT_ARMS_EMAIL;
+          await notify(
+            sgtEmail,
+            "sgt_alert",
+            `Judicial review flagged: ${fullName}`,
+            `${fullName} has reached ${newCount} no-shows this quarter (last: ${meeting.title} on ${fmtDate(meeting.date)}). Per Article VI bylaws, judicial review may be appropriate. The brother has also been notified.`,
+            "judicial",
+            noShowDocRef.id
+          );
+        }
       } catch (e) {
-        toast("Permission denied", true);
+        console.warn(`No-show creation failed for ${brother.firstName}:`, e);
       }
-    })
-  );
+    }
+  }
+  } finally {
+    _processingLock = false;
+  }
 }
 
-$("filter-event").addEventListener("change", renderAttendance);
-
-// ===================================================================
-// ROSTER PANEL
-// ===================================================================
-$("roster-search").addEventListener("input", renderRoster);
-$("roster-sort").addEventListener("change", renderRoster);
-
-function renderRoster() {
-  const search   = $("roster-search").value.trim().toLowerCase();
-  const sortMode = $("roster-sort").value;
-  const grid     = $("roster-grid");
-
-  const counts = {};
-  state.checkins.forEach(c => {
-    const key = c.brotherKey || c.name.toLowerCase();
-    counts[key] = (counts[key] || 0) + 1;
-  });
-
-  const totalEvents = state.events.length || 1;
-  const enriched = state.roster.map(b => ({
-    ...b,
-    count: counts[b.key] || 0,
-    rate:  (counts[b.key] || 0) / totalEvents,
-  }));
-
-  let filtered = enriched.filter(b => {
-    if (!search) return true;
-    return (b.firstName + " " + b.lastName).toLowerCase().includes(search);
-  });
-
-  if      (sortMode === "count-desc") filtered.sort((a, b) => b.count - a.count || a.lastName.localeCompare(b.lastName));
-  else if (sortMode === "count-asc")  filtered.sort((a, b) => a.count - b.count || a.lastName.localeCompare(b.lastName));
-  else                                 filtered.sort((a, b) => a.lastName.localeCompare(b.lastName));
-
-  $("roster-total").textContent = filtered.length;
-
-  if (!state.roster.length) {
-    grid.innerHTML = '<div class="empty" style="grid-column: span 2;">Roster is empty. Sign in as exec and use Add or Import to populate it.</div>';
-    return;
-  }
-  if (!filtered.length) {
-    grid.innerHTML = '<div class="empty" style="grid-column: span 2;">No brothers match that search.</div>';
-    return;
+// Manually triggerable from the Meetings tab (exec button on past meetings)
+async function manualProcessMeeting(meetingId) {
+  const meeting = state.meetings.find(m => m.id === meetingId);
+  if (!meeting) return toast("Meeting not found — refresh", true);
+  if (!qrWindow(meeting).isPast) {
+    return toast("Meeting hasn't ended yet", true);
   }
 
-  const canEdit = !!state.user;
-  grid.innerHTML = filtered.map(b => {
-    const fullName = b.firstName + " " + b.lastName;
-    const pct = state.events.length ? Math.round(b.rate * 100) : 0;
-    const cls = b.count === 0 ? "zero" : (b.rate >= 0.5 ? "high" : "");
-    return `<div class="roster-item ${cls}">
-      <span class="roster-name">${escapeHtml(fullName)}</span>
-      <div style="display:flex; align-items:center;">
-        <div class="roster-bar-wrap">
-          <span class="roster-count">${b.count} / ${state.events.length} • ${pct}%</span>
-          <div class="roster-bar"><span style="width:${Math.min(100, pct)}%"></span></div>
+  // Snapshot before
+  const noShowsBefore = state.noShows.filter(n => n.meetingId === meetingId).length;
+  const eligible = state.roster.filter(brotherIsEligible);
+  const presentSet = new Set(state.attendance.filter(a => a.meetingId === meetingId).map(a => a.brotherKey));
+  const expectedNoShows = eligible.filter(b => !presentSet.has(b.key)).length;
+
+  console.log("[Process Meeting]", {
+    meetingId,
+    title: meeting.title,
+    quarter: meeting.quarter,
+    eligibleBrothers: eligible.length,
+    rosterTotal: state.roster.length,
+    presentForMeeting: presentSet.size,
+    existingNoShows: noShowsBefore,
+    expectedNewNoShows: expectedNoShows - noShowsBefore,
+  });
+
+  // Diagnose common failure modes upfront
+  if (eligible.length === 0) {
+    return toast("No eligible brothers in roster (need status 'Active' or 'New Member')", true);
+  }
+  if (!meeting.quarter) {
+    return toast("Meeting has no quarter set — re-create the meeting", true);
+  }
+
+  toast("Processing no-shows...");
+  await autoDenyPendingPastStart();
+  await processClosedMeetings();
+
+  // Brief delay to let Firestore subscription update, then report
+  setTimeout(() => {
+    const noShowsAfter = state.noShows.filter(n => n.meetingId === meetingId).length;
+    const created = noShowsAfter - noShowsBefore;
+    if (created === 0) {
+      if (expectedNoShows === 0) {
+        toast("All eligible brothers were marked present — no no-shows to create");
+      } else if (noShowsBefore === expectedNoShows) {
+        toast(`Already up to date — ${noShowsBefore} no-show${noShowsBefore === 1 ? "" : "s"} on record`);
+      } else {
+        toast("No new no-shows created — check console for diagnostics", true);
+      }
+    } else {
+      toast(`Created ${created} no-show${created === 1 ? "" : "s"}`);
+    }
+  }, 1500);
+}
+
+// ===================================================================
+// STAGE 4 — APPEAL MODAL
+// ===================================================================
+
+let currentAppealNoShowId = null;
+
+// ===================================================================
+// STAGE 5B — IN-APP NOTIFICATIONS
+// ===================================================================
+// Notification generation, sign-in modal display, fine aura.
+// ===================================================================
+
+// Recipient notification creator. `relatedId` lets us avoid duplicates.
+async function notify(recipientEmail, type, title, message, severity, relatedId) {
+  if (!recipientEmail) return;
+  // Idempotency: don't create duplicate notifications for the same source event
+  if (relatedId) {
+    const existing = state.notifications.find(n =>
+      n.recipientEmail === recipientEmail &&
+      n.type === type &&
+      n.relatedId === relatedId
+    );
+    if (existing) return;
+  }
+  try {
+    await notifications.create({
+      recipientEmail: recipientEmail.toLowerCase(),
+      type,
+      title,
+      message,
+      severity, // "info" | "warning" | "danger" | "judicial"
+      relatedId: relatedId || null,
+    });
+  } catch (e) {
+    console.warn("Failed to create notification:", e);
+  }
+}
+
+// Notification type → message templates
+function buildNoShowNotification(brotherName, meeting, count, fineAmount) {
+  if (count === 1) {
+    return {
+      title: "1st No-Show — Warning",
+      message: `Hey ${brotherName.split(" ")[0]}, you missed ${meeting.title} on ${fmtDate(meeting.date)}. This is your first no-show this quarter — heads up that the 2nd one is a $${fineAmount} fine. If you had an excuse you didn't submit, you can appeal from your dashboard.`,
+      severity: "warning",
+    };
+  }
+  if (count === 2) {
+    return {
+      title: `2nd No-Show — $${fineAmount} Fine`,
+      message: `${brotherName.split(" ")[0]}, your 2nd no-show this quarter triggered a $${fineAmount} fine. Pay the treasurer before quarter end. If you had legitimate grounds, file an appeal from your dashboard within a reasonable window.`,
+      severity: "danger",
+    };
+  }
+  return {
+    title: "3rd No-Show — Judicial Review",
+    message: `${brotherName.split(" ")[0]}, this is your 3rd no-show this quarter. Per chapter bylaws (Article VI), the Sgt-at-Arms will be notified and may bring this to the judicial board. Reach out to him directly if you want to discuss.`,
+    severity: "judicial",
+  };
+}
+
+// Whether a notification is pending acknowledgment for current user
+function pendingNotificationsFor(email) {
+  if (!email) return [];
+  return state.notifications
+    .filter(n => n.recipientEmail === email.toLowerCase() && !n.acknowledgedAt)
+    .sort((a, b) => {
+      // High severity first, then oldest first
+      const severityOrder = { judicial: 0, danger: 1, warning: 2, info: 3 };
+      const sa = severityOrder[a.severity] ?? 4;
+      const sb = severityOrder[b.severity] ?? 4;
+      if (sa !== sb) return sa - sb;
+      return (a.createdAt || 0) - (b.createdAt || 0);
+    });
+}
+
+// Show pending notifications as full-screen stacked modals
+let _displayingNotification = false;
+async function showPendingNotifications() {
+  if (_displayingNotification) return;
+  if (!state.user || !state.user.email) return;
+
+  const pending = pendingNotificationsFor(state.user.email);
+  if (pending.length === 0) {
+    $("notif-modal").classList.remove("visible");
+    return;
+  }
+
+  _displayingNotification = true;
+  const n = pending[0];
+  const remaining = pending.length - 1;
+
+  $("notif-modal").className = `modal visible notif-${n.severity || "info"}`;
+  $("notif-title").textContent = n.title || "Notification";
+  $("notif-message").textContent = n.message || "";
+  $("notif-meta").textContent = n.createdAt
+    ? `${relativeTime(n.createdAt)}${remaining > 0 ? ` • ${remaining} more after this` : ""}`
+    : (remaining > 0 ? `${remaining} more after this` : "");
+
+  // Severity-aware acknowledgment label
+  const ackLabel = n.severity === "judicial" ? "I Understand"
+                 : n.severity === "danger"   ? "I Acknowledge"
+                 : "Got It";
+  $("notif-ack").textContent = ackLabel;
+  $("notif-ack").dataset.id = n.id;
+
+  _displayingNotification = false;
+}
+
+// Update fine aura — body class toggle that activates the multi-color glow
+function updateFineAura() {
+  if (!state.user || !state.user.rosterEntry) {
+    document.body.classList.remove("has-active-fine");
+    return;
+  }
+  const target = state.user.rosterEntry;
+  const hasActiveFine = state.fines.some(f =>
+    f.brotherKey === target.key && f.status === "pending"
+  );
+  document.body.classList.toggle("has-active-fine", hasActiveFine);
+}
+
+function openAppealModal(noShowId) {
+  const ns = state.noShows.find(n => n.id === noShowId);
+  if (!ns) return;
+  currentAppealNoShowId = noShowId;
+  $("appeal-meeting-title").textContent = ns.meetingTitle || "Meeting";
+  $("appeal-meeting-meta").textContent =
+    `${fmtDateLong(ns.meetingDate || "")} • ${noShowReasonLabel(ns.reason)}`;
+  $("appeal-reason").value = "";
+  $("appeal-modal").classList.add("visible");
+  setTimeout(() => $("appeal-reason").focus(), 100);
+}
+
+async function submitAppeal() {
+  const reason = $("appeal-reason").value.trim();
+  if (reason.length < 20) {
+    return toast("Be specific in your appeal (20+ characters)", true);
+  }
+  if (!currentAppealNoShowId) return;
+  const ns = state.noShows.find(n => n.id === currentAppealNoShowId);
+  try {
+    await noShows.appeal(currentAppealNoShowId, reason);
+    $("appeal-modal").classList.remove("visible");
+    toast("Appeal submitted — Sgt-at-Arms will review");
+
+    // Notify Sgt-at-Arms
+    if (ns) {
+      const sgtEmail = state.settings.sgtAtArmsEmail || SGT_AT_ARMS_EMAIL;
+      await notify(
+        sgtEmail,
+        "appeal_submitted",
+        `Appeal submitted: ${ns.brotherName}`,
+        `${ns.brotherName} appealed their no-show for ${ns.meetingTitle || "a meeting"} on ${fmtDate(ns.meetingDate || "")}. Reason given: "${reason}". Review in the Absence Requests tab.`,
+        "warning",
+        currentAppealNoShowId
+      );
+    }
+
+    currentAppealNoShowId = null;
+  } catch (e) {
+    console.error(e);
+    toast("Could not submit appeal", true);
+  }
+}
+
+// ===================================================================
+// MEETINGS TAB  (Stage 2 — exec creates, everyone views)
+// ===================================================================
+function countMandatoryThisQuarter(quarter) {
+  return state.meetings.filter(m => m.mandatory && m.quarter === quarter).length;
+}
+
+// Tracks whether the form has been built for the current user role.
+// Only re-builds when the role changes (exec vs not-exec), NOT on Firestore updates.
+let _meetingsFormBuiltFor = null; // "exec" | "non-exec" | null
+
+function renderMeetingsTab() {
+  const wrap = $("meetings-content");
+  if (!wrap) return;
+
+  const isExec = !!(state.user && state.user.isExec);
+  const formKey = isExec ? "exec" : "non-exec";
+
+  // ----- Build form ONCE per role state (preserves user input across re-renders) -----
+  if (_meetingsFormBuiltFor !== formKey) {
+    wrap.innerHTML = `
+      <div id="meetings-form-container"></div>
+      <div id="meetings-list-container"></div>
+    `;
+    const formContainer = $("meetings-form-container");
+    if (isExec) {
+      formContainer.innerHTML = renderCreateMeetingFormShell();
+      $("mtg-create")?.addEventListener("click", handleCreateMeeting);
+      ["mtg-date", "mtg-start", "mtg-mandatory"].forEach(id => {
+        $(id)?.addEventListener("input", updateLeadTimeHint);
+        $(id)?.addEventListener("change", updateLeadTimeHint);
+      });
+      defaultMeetingDate();
+      updateLeadTimeHint();
+    } else {
+      formContainer.innerHTML = "";
+    }
+    _meetingsFormBuiltFor = formKey;
+  }
+
+  // ----- Update mandatory-cap warning WITHOUT wiping the form -----
+  if (isExec) updateMandatoryCapHint();
+
+  // ----- Re-render the meeting list freely (this is the safe-to-rebuild part) -----
+  const upcoming = state.meetings.filter(m => !qrWindow(m).isPast).filter(inQuarter);
+  const past     = state.meetings.filter(m => qrWindow(m).isPast).filter(inQuarter);
+  const sortAsc  = (a, b) => qrWindow(a).start - qrWindow(b).start;
+  const sortDesc = (a, b) => qrWindow(b).start - qrWindow(a).start;
+  upcoming.sort(sortAsc);
+  past.sort(sortDesc);
+
+  const showPast = state.showPastMeetings;
+  const visible = showPast ? past : upcoming;
+
+  $("meetings-list-container").innerHTML = `
+    <div class="card">
+      <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 14px;">
+        <div>
+          <div class="card-title">${showPast ? "Past Meetings" : "Upcoming Meetings"}</div>
+          <div class="card-sub">${formatQuarter(state.selectedQuarter)} &middot; ${visible.length} meeting${visible.length === 1 ? "" : "s"}</div>
         </div>
-        ${canEdit ? `<button class="roster-delete" data-del-brother="${b.key}" title="Remove from roster">×</button>` : ""}
+        <div style="display: flex; gap: 8px;">
+          <button class="btn btn-ghost btn-small" id="meetings-toggle">
+            ${showPast ? "Show Upcoming" : `Show Past (${past.length})`}
+          </button>
+        </div>
       </div>
-    </div>`;
-  }).join("");
 
-  grid.querySelectorAll("[data-del-brother]").forEach(b =>
-    b.addEventListener("click", () => deleteBrother(b.dataset.delBrother))
-  );
+      ${visible.length === 0
+        ? `<div class="empty">${showPast ? "No past meetings in this quarter." : (isExec ? "No upcoming meetings — create one above." : "No upcoming meetings.")}</div>`
+        : `<div class="event-list" style="display: flex; flex-direction: column; gap: 10px; margin-top: 14px;">
+            ${visible.map(m => renderMeetingRow(m, isExec)).join("")}
+          </div>`}
+    </div>
+  `;
+
+  // Wire list buttons (these are inside the dynamic container so safe to re-bind)
+  $("meetings-toggle")?.addEventListener("click", () => {
+    state.showPastMeetings = !state.showPastMeetings;
+    renderMeetingsTab();
+  });
+
+  const listWrap = $("meetings-list-container");
+  listWrap.querySelectorAll("[data-qr]").forEach(b =>
+    b.addEventListener("click", () => openQrModal(b.dataset.qr)));
+  listWrap.querySelectorAll("[data-del]").forEach(b =>
+    b.addEventListener("click", () => deleteMeeting(b.dataset.del)));
+  listWrap.querySelectorAll("[data-roll]").forEach(b =>
+    b.addEventListener("click", () => openRollSheet(b.dataset.roll)));
+  listWrap.querySelectorAll("[data-process]").forEach(b =>
+    b.addEventListener("click", () => manualProcessMeeting(b.dataset.process)));
 }
 
-async function deleteBrother(key) {
-  const b = state.roster.find(x => x.key === key);
-  if (!b) return;
-  const cnt = state.checkins.filter(c => c.brotherKey === key).length;
-  const msg = cnt > 0
-    ? `Remove ${b.firstName} ${b.lastName} from the roster? Their ${cnt} check-in${cnt === 1 ? "" : "s"} will stay in the log for history.`
-    : `Remove ${b.firstName} ${b.lastName} from the roster?`;
-  if (!confirm(msg)) return;
-  try {
-    await roster.remove(key);
-    toast("Brother removed");
-  } catch (e) {
-    toast("Permission denied", true);
+// Form shell — built once. The mandatory-cap text is in a child element we
+// update separately so the inputs are never destroyed mid-typing.
+function renderCreateMeetingFormShell() {
+  return `
+    <div class="card exec-only">
+      <div class="card-title">Create Meeting</div>
+      <div class="card-sub">Secretary: schedule a chapter meeting</div>
+
+      <div class="mtg-tip">
+        <div class="mtg-tip-label">Scheduling Tip</div>
+        <div class="mtg-tip-body">
+          Create chapter meetings <strong>more than 48 hours in advance</strong>, and ideally <strong>2 weeks ahead</strong>.
+          Brothers can only submit absence requests through the app up to 48 hours before a meeting, so scheduling
+          early gives them time to plan and request an excuse. Mandatory meetings require 14 days' notice (Article VI §12).
+        </div>
+      </div>
+
+      <div class="row-2">
+        <div>
+          <label for="mtg-title">Meeting Title</label>
+          <input type="text" id="mtg-title" placeholder="Weekly Chapter Meeting" autocomplete="off">
+        </div>
+        <div>
+          <label for="mtg-date">Date</label>
+          <input type="date" id="mtg-date">
+        </div>
+      </div>
+
+      <div class="row-3">
+        <div>
+          <label for="mtg-start">Start Time</label>
+          <input type="time" id="mtg-start" value="19:00">
+        </div>
+        <div>
+          <label for="mtg-end">End Time</label>
+          <input type="time" id="mtg-end" value="20:00">
+        </div>
+        <div>
+          <label for="mtg-window">QR Window <span style="font-weight: normal; color: var(--true-gold); text-transform: none; letter-spacing: 0;">(min after start)</span></label>
+          <input type="number" id="mtg-window" value="5" min="1" max="60">
+        </div>
+      </div>
+
+      <div id="mtg-leadtime" class="mtg-leadtime" aria-live="polite"></div>
+
+      <label for="mtg-location">Location</label>
+      <input type="text" id="mtg-location" placeholder="Chapter house living room" autocomplete="off">
+
+      <div id="mtg-mandatory-row" style="display: flex; align-items: center; gap: 12px; margin-top: 18px; padding: 12px 14px; background: var(--light-gold); border-left: 3px solid var(--burgundy);">
+        <input type="checkbox" id="mtg-mandatory" style="width: auto; margin: 0;">
+        <label for="mtg-mandatory" id="mtg-mandatory-label" style="margin: 0; cursor: pointer;">
+          Mandatory Meeting
+        </label>
+        <span id="mtg-mandatory-hint" style="font-family: Georgia, serif; font-size: 12px; font-style: italic; color: var(--true-gold);"></span>
+      </div>
+
+      <button class="btn" id="mtg-create">Create Meeting</button>
+    </div>
+  `;
+}
+
+// Updates the mandatory-cap row in place (does NOT touch the inputs).
+function updateMandatoryCapHint() {
+  const todayQ = currentQuarter();
+  const mandCount = countMandatoryThisQuarter(todayQ);
+  const mandFull = mandCount >= 4;
+
+  const row = $("mtg-mandatory-row");
+  const cb = $("mtg-mandatory");
+  const lbl = $("mtg-mandatory-label");
+  const hint = $("mtg-mandatory-hint");
+  if (!row || !cb || !lbl || !hint) return;
+
+  if (mandFull) {
+    cb.disabled = true;
+    cb.checked = false;
+    row.style.borderLeft = "3px solid var(--knight-steel)";
+    lbl.style.cursor = "not-allowed";
+    lbl.style.color = "var(--knight-steel)";
+    hint.textContent = `Bylaws limit mandatory meetings to 4 per quarter. ${formatQuarter(todayQ)} already has 4.`;
+  } else {
+    cb.disabled = false;
+    row.style.borderLeft = "3px solid var(--burgundy)";
+    lbl.style.cursor = "pointer";
+    lbl.style.color = "";
+    const remaining = 4 - mandCount;
+    hint.textContent = `${remaining} mandatory slot${remaining === 1 ? "" : "s"} remaining this quarter (Article VI §12)`;
   }
 }
 
-$("ab-add").addEventListener("click", async () => {
-  if (!state.user) return toast("Sign in as exec to edit the roster", true);
-  const first  = $("ab-first").value.trim();
-  const last   = $("ab-last").value.trim();
-  const status = $("ab-status").value;
-  const email  = $("ab-email").value.trim();
-  if (!first || !last) return toast("First and last name required", true);
+async function handleCreateMeeting() {
+  if (!state.user || !state.user.isExec) return toast("Sign in as exec", true);
 
-  const key = brotherKeyOf({ firstName: first, lastName: last });
-  if (state.roster.some(b => b.key === key))
-    return toast("That brother is already in the roster", true);
+  const title     = $("mtg-title").value.trim();
+  const date      = $("mtg-date").value;
+  const startTime = $("mtg-start").value;
+  const endTime   = $("mtg-end").value;
+  const location  = $("mtg-location").value.trim();
+  const mandatory = $("mtg-mandatory").checked;
+  const qrWin     = Math.max(1, Math.min(60, Number($("mtg-window").value) || 5));
+
+  if (!title)     return toast("Meeting title is required", true);
+  if (!date)      return toast("Date is required", true);
+  if (!startTime) return toast("Start time is required", true);
+  if (!endTime)   return toast("End time is required", true);
+
+  // Validate that end is after start
+  const startDt = combineLocalDateTime(date, startTime);
+  const endDt   = combineLocalDateTime(date, endTime);
+  if (endDt.getTime() <= startDt.getTime()) {
+    return toast("End time must be after start time", true);
+  }
+
+  // Compute the meeting's quarter from its date
+  const [yr, mo, dy] = date.split("-").map(Number);
+  const meetingQuarter = (() => {
+    const m = mo - 1;
+    if (m <= 2)  return `${yr}-winter`;
+    if (m <= 5)  return `${yr}-spring`;
+    if (m <= 7)  return `${yr}-summer`;
+    return `${yr}-fall`;
+  })();
+
+  // Short-notice check: under 48 hours means brothers can't use the app to
+  // request an absence. (Mandatory meetings get the stricter 14-day check below.)
+  const hoursOut = (startDt.getTime() - Date.now()) / 3600000;
+  if (!mandatory && hoursOut < 48) {
+    const ok = confirm(
+      `This meeting is less than 48 hours away, so brothers won't be able to submit ` +
+      `absence requests through the app. They'll need to contact the secretary directly. ` +
+      `Create anyway?`
+    );
+    if (!ok) return;
+  }
+
+  // Bylaw cap re-check for the quarter the meeting falls in (not just current)
+  if (mandatory) {
+    const inQuarterMandCount = state.meetings.filter(m => m.mandatory && m.quarter === meetingQuarter).length;
+    if (inQuarterMandCount >= 4) {
+      return toast(`${formatQuarter(meetingQuarter)} already has 4 mandatory meetings (bylaws cap)`, true);
+    }
+
+    // 14-day notice warning per Article VI §12
+    const daysOut = (startDt.getTime() - Date.now()) / (24 * 60 * 60 * 1000);
+    if (daysOut < 14) {
+      const ok = confirm(
+        `Bylaws require 14 days advance notice for mandatory meetings (Article VI §12). ` +
+        `This meeting is only ${Math.round(daysOut)} day${Math.round(daysOut) === 1 ? "" : "s"} out. ` +
+        `Create anyway?`
+      );
+      if (!ok) return;
+    }
+  }
 
   try {
-    await roster.upsert({ firstName: first, lastName: last, status, email });
-    $("ab-first").value = "";
-    $("ab-last").value  = "";
-    $("ab-email").value = "";
-    $("ab-status").value = "New Member";
-    toast("Brother added");
-  } catch (e) {
-    toast("Permission denied", true);
-  }
-});
+    const meetingRef = await meetings.create({
+      title, date, startTime, endTime, location,
+      mandatory, qrWindowMinutes: qrWin,
+    });
+    $("mtg-title").value = "";
+    $("mtg-location").value = "";
+    $("mtg-mandatory").checked = false;
+    updateLeadTimeHint();
+    toast("Meeting created");
 
-["ab-first", "ab-last", "ab-email"].forEach(id =>
-  $(id).addEventListener("keydown", (e) => {
-    if (e.key === "Enter") { e.preventDefault(); $("ab-add").click(); }
-  })
-);
-
-// ===================================================================
-// ROSTER IMPORT (CSV / Excel)
-// ===================================================================
-const importModal = $("import-modal");
-const importFile  = $("import-file");
-
-$("import-roster-btn").addEventListener("click", () => {
-  if (!state.user) return toast("Sign in as exec to import a roster", true);
-  importFile.value = "";
-  importFile.click();
-});
-
-importFile.addEventListener("change", async (e) => {
-  const file = e.target.files && e.target.files[0];
-  if (!file) return;
-  if (typeof XLSX === "undefined") return toast("Spreadsheet library still loading", true);
-  try {
-    const buf = await file.arrayBuffer();
-    const wb  = XLSX.read(new Uint8Array(buf), { type: "array" });
-    const ws  = wb.Sheets[wb.SheetNames[0]];
-    if (!ws) throw new Error("No worksheet");
-    const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
-    const parsed = rows.map(normalizeImportRow).filter(r => r);
-    if (!parsed.length) return toast("No brothers found in that file", true);
-    pendingImport = parsed;
-    showImportPreview(parsed);
-  } catch (err) {
-    console.error(err);
-    toast("Could not read that file", true);
-  }
-});
-
-function normalizeImportRow(row) {
-  const get = (...names) => {
-    for (const wanted of names) {
-      for (const k of Object.keys(row)) {
-        if (k.replace(/\s+/g, "").toLowerCase() === wanted.replace(/\s+/g, "").toLowerCase()) {
-          return String(row[k] == null ? "" : row[k]).trim();
+    // If mandatory, notify the entire chapter (all eligible brothers)
+    if (mandatory) {
+      const eligible = state.roster.filter(brotherIsEligible);
+      const meetingId = meetingRef; // meetings.create returns the ID directly
+      const startTimeFmt = fmtTime(startTime);
+      let notifSent = 0;
+      for (const b of eligible) {
+        if (!b.email) continue;
+        try {
+          await notify(
+            b.email,
+            "mandatory_meeting",
+            `⚑ Mandatory Meeting: ${title}`,
+            `Per Article VI §12, a MANDATORY meeting has been scheduled: ${title} on ${fmtDateLong(date)} at ${startTimeFmt}${location ? ` (${location})` : ""}. Attendance is required. If you can't attend, submit an absence request immediately — but exec verbal approval is required for mandatory meetings.`,
+            "warning",
+            typeof meetingId === "string" ? meetingId : null
+          );
+          notifSent++;
+        } catch (e) {
+          console.warn("Mandatory notif failed for", b.email, e);
         }
       }
+      if (notifSent > 0) {
+        toast(`Meeting created • ${notifSent} brothers notified`);
+      }
     }
-    return "";
-  };
-  let first = get("First Name", "firstname", "first", "fname", "given name");
-  let last  = get("Last Name", "lastname", "last", "lname", "surname", "family name");
-  if (!first && !last) {
-    const fullName = get("Name", "Full Name", "fullname");
-    if (fullName) {
-      const parts = fullName.split(/\s+/);
-      first = parts[0] || "";
-      last  = parts.slice(1).join(" ") || "";
-    }
-  }
-  if (!first || !last) return null;
-  return {
-    firstName: first,
-    lastName:  last,
-    status:    get("Status") || "Active",
-    email:     get("Email", "E-mail", "Email Address"),
-  };
-}
-
-function showImportPreview(parsed) {
-  const summary    = $("import-summary");
-  const previewEl  = $("import-preview");
-  const importedKeys = new Set(parsed.map(brotherKeyOf));
-  const currentKeys  = new Set(state.roster.map(b => b.key));
-  const newCount     = parsed.filter(b => !currentKeys.has(brotherKeyOf(b))).length;
-  const updateCount  = parsed.length - newCount;
-  const removedIfRep = state.roster.filter(b => !importedKeys.has(b.key)).length;
-
-  summary.innerHTML = `
-    <div style="font-family: Georgia, serif; font-size: 14px; margin-bottom: 8px;">
-      <strong style="color: var(--garnet);">${parsed.length}</strong> brothers found in file
-    </div>
-    <div style="font-family: Arial, sans-serif; font-size: 11px; letter-spacing: 1px; text-transform: uppercase; line-height: 1.7;">
-      <span style="color: var(--garnet);">+ ${newCount} new</span> &nbsp;·&nbsp;
-      <span style="color: var(--true-gold);">~ ${updateCount} updates</span> &nbsp;·&nbsp;
-      <span style="color: var(--burgundy);">${removedIfRep} would be removed if Replace All</span>
-    </div>`;
-
-  previewEl.innerHTML = parsed.slice(0, 50).map(b => {
-    const isNew = !currentKeys.has(brotherKeyOf(b));
-    return `<div style="padding:8px 12px; border-bottom:1px solid var(--light-gold); display:flex; justify-content:space-between; align-items:center; font-family:Georgia,serif; font-size:13px;">
-      <span>${escapeHtml(b.firstName + " " + b.lastName)} &nbsp;<span style="font-family:Arial; font-size:9px; letter-spacing:1px; text-transform:uppercase; color:var(--true-gold);">${escapeHtml(b.status)}</span></span>
-      <span style="font-family:Arial; font-size:9px; letter-spacing:1px; text-transform:uppercase; color:${isNew ? "var(--garnet)" : "var(--slate)"};">${isNew ? "NEW" : "EXISTING"}</span>
-    </div>`;
-  }).join("") + (parsed.length > 50
-    ? `<div style="padding:8px 12px; font-family:Georgia,serif; font-style:italic; color:var(--true-gold); font-size:12px;">+ ${parsed.length - 50} more...</div>`
-    : "");
-
-  importModal.classList.add("visible");
-}
-
-async function applyImport(mode) {
-  if (!pendingImport) return;
-  try {
-    if (mode === "replace") await roster.bulkReplace(pendingImport);
-    else                    await roster.bulkMerge(pendingImport);
-    importModal.classList.remove("visible");
-    pendingImport = null;
-    toast(mode === "replace" ? "Roster replaced" : "Roster merged");
   } catch (e) {
     console.error(e);
-    toast("Import failed — check permissions", true);
+    toast("Permission denied — exec sign-in required", true);
   }
 }
 
-$("import-merge").addEventListener("click",   () => applyImport("merge"));
-$("import-replace").addEventListener("click", () => {
-  if (confirm("Replace the entire roster? Brothers not in the file will be removed."))
-    applyImport("replace");
-});
-$("import-cancel").addEventListener("click",      () => { pendingImport = null; importModal.classList.remove("visible"); });
-$("import-modal-close").addEventListener("click", () => { pendingImport = null; importModal.classList.remove("visible"); });
-importModal.addEventListener("click", (e) => {
-  if (e.target === importModal) {
-    pendingImport = null;
-    importModal.classList.remove("visible");
+function renderMeetingRow(m, isExec) {
+  const w = qrWindow(m);
+  const attendees = state.attendance.filter(a => a.meetingId === m.id);
+  const isOpen   = w.isOpen;
+  const isPast   = w.isPast;
+  const isFuture = w.isFuture;
+
+  let timingBadge;
+  if (isOpen) {
+    timingBadge = `<span style="background: var(--crimson); color: white; padding: 2px 8px; font-family: Arial; font-size: 10px; font-weight: bold; letter-spacing: 1px;">QR OPEN — closes ${relativeTime(w.closes)}</span>`;
+  } else if (isFuture) {
+    timingBadge = `<span style="background: var(--khaki); color: var(--burgundy); padding: 2px 8px; font-family: Arial; font-size: 10px; font-weight: bold; letter-spacing: 1px;">${relativeTime(w.start).toUpperCase()}</span>`;
+  } else {
+    timingBadge = `<span style="background: var(--knight-steel); color: white; padding: 2px 8px; font-family: Arial; font-size: 10px; font-weight: bold; letter-spacing: 1px;">PAST</span>`;
   }
-});
 
-// ===================================================================
-// EXPORTS (CSV + Excel)
-// ===================================================================
-$("export-csv").addEventListener("click", () => {
-  if (!state.checkins.length) return toast("No check-ins to export", true);
-  const headers = ["Brother", "Status", "Email", "Event", "Type", "Date", "Location", "Checked In"];
-  const rows = state.checkins.map(c => {
-    const ev = state.events.find(e => e.id === c.eventId) || {};
-    return [
-      c.name, c.status || "", c.email || "",
-      ev.name || "", ev.type || "", ev.date || "", ev.location || "",
-      new Date(c.timestamp).toISOString(),
-    ];
-  });
-  const csv = [headers, ...rows]
-    .map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(","))
-    .join("\n");
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
-  a.download = `pike-attendance-${new Date().toISOString().slice(0, 10)}.csv`;
-  a.click();
-  toast("CSV exported");
-});
+  return `
+    <div class="event-row" style="display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; background: white; border: 1px solid rgba(170,151,103,0.3); ${m.mandatory ? "border-left: 3px solid var(--burgundy);" : ""} gap: 12px; flex-wrap: wrap;">
+      <div style="flex: 1; min-width: 220px;">
+        <div style="font-family: 'Cormorant Garamond', Georgia, serif; font-size: 18px; font-weight: 600; color: var(--garnet);">
+          ${escapeHtml(m.title)} ${m.mandatory ? `<span style="font-family: Arial; font-size: 9px; letter-spacing: 1.5px; color: var(--burgundy); margin-left: 6px;">⚑ MANDATORY</span>` : ""}
+        </div>
+        <div style="font-family: Arial, sans-serif; font-size: 11px; color: var(--slate); letter-spacing: 1px; margin-top: 4px;">
+          ${escapeHtml(fmtDate(m.date))} &middot; ${fmtTime(m.startTime)}–${fmtTime(m.endTime)}${m.location ? " &middot; " + escapeHtml(m.location) : ""}
+        </div>
+        <div style="margin-top: 6px;">
+          ${timingBadge}
+        </div>
+      </div>
+      <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+        <span style="background: var(--garnet); color: white; padding: 6px 12px; font-family: Arial; font-size: 11px; font-weight: bold; letter-spacing: 1px;">
+          ${attendees.length} present
+        </span>
+        <button class="btn btn-ghost btn-small" data-qr="${m.id}">QR</button>
+        ${isExec ? `<button class="btn btn-ghost btn-small" data-roll="${m.id}">Roll</button>` : ""}
+        ${isExec && isPast ? `<button class="btn btn-ghost btn-small" data-process="${m.id}">Process</button>` : ""}
+        ${isExec ? `<button class="btn btn-danger btn-small" data-del="${m.id}">Delete</button>` : ""}
+      </div>
+    </div>
+  `;
+}
 
-$("export-xlsx").addEventListener("click", () => {
-  if (typeof XLSX === "undefined") return toast("Excel library still loading", true);
-  if (!state.events.length && !state.checkins.length) return toast("Nothing to export yet", true);
+async function deleteMeeting(id) {
+  const m = state.meetings.find(x => x.id === id);
+  if (!m) return;
+  const attCount = state.attendance.filter(a => a.meetingId === id).length;
+  const reqCount = state.absenceRequests.filter(r => r.meetingId === id).length;
+  const nsCount  = state.noShows.filter(n => n.meetingId === id).length;
+  const fnCount  = state.fines.filter(f => f.meetingId === id).length;
 
-  const wb = XLSX.utils.book_new();
+  const parts = [];
+  if (attCount) parts.push(`${attCount} attendance record${attCount === 1 ? "" : "s"}`);
+  if (reqCount) parts.push(`${reqCount} absence request${reqCount === 1 ? "" : "s"}`);
+  if (nsCount)  parts.push(`${nsCount} no-show record${nsCount === 1 ? "" : "s"}`);
+  if (fnCount)  parts.push(`${fnCount} fine record${fnCount === 1 ? "" : "s"}`);
 
-  // Sheet 1: Check-Ins
-  const ws1 = XLSX.utils.aoa_to_sheet([
-    ["Brother", "Status", "Email", "Event", "Type", "Date", "Location", "Checked In"],
-    ...state.checkins.map(c => {
-      const ev = state.events.find(e => e.id === c.eventId) || {};
-      return [c.name, c.status || "", c.email || "", ev.name || "", ev.type || "", ev.date || "", ev.location || "", new Date(c.timestamp).toLocaleString()];
-    }),
-  ]);
-  ws1["!cols"] = [{wch:22},{wch:14},{wch:30},{wch:28},{wch:14},{wch:12},{wch:24},{wch:22}];
-  XLSX.utils.book_append_sheet(wb, ws1, "Check-Ins");
+  const msg = parts.length === 0
+    ? `Delete "${m.title}"?`
+    : `Delete "${m.title}" and ALL associated data?\n\nThis will also remove:\n• ${parts.join("\n• ")}\n\nThis cannot be undone.`;
 
-  // Sheet 2: By Brother
-  const counts = {};
-  const evNames = {};
-  state.checkins.forEach(c => {
-    const k = c.brotherKey || c.name.toLowerCase();
-    counts[k] = (counts[k] || 0) + 1;
-    const ev = state.events.find(e => e.id === c.eventId);
-    if (ev) (evNames[k] = evNames[k] || []).push(ev.name);
-  });
-  const totalEv = state.events.length;
-  const brotherRows = state.roster.map(b => {
-    const cnt  = counts[b.key] || 0;
-    const rate = totalEv ? cnt / totalEv : 0;
-    return [
-      b.firstName + " " + b.lastName, b.status, b.email,
-      cnt, totalEv, Math.round(rate * 100) + "%",
-      (evNames[b.key] || []).join("; "),
-    ];
-  });
-  brotherRows.sort((a, b) => b[3] - a[3] || String(a[0]).localeCompare(String(b[0])));
-  const ws2 = XLSX.utils.aoa_to_sheet([
-    ["Brother", "Status", "Email", "Events Attended", "Total Events", "Attendance Rate", "Event List"],
-    ...brotherRows,
-  ]);
-  ws2["!cols"] = [{wch:24},{wch:14},{wch:30},{wch:18},{wch:14},{wch:18},{wch:60}];
-  XLSX.utils.book_append_sheet(wb, ws2, "By Brother");
+  if (!confirm(msg)) return;
+  try {
+    await meetings.remove(id);
+    toast("Meeting and associated data deleted");
+  } catch (e) {
+    console.error(e);
+    toast("Delete failed — check console", true);
+  }
+}
 
-  // Sheet 3: By Event
-  const evRows = state.events.map(ev => {
-    const attendees = state.checkins.filter(c => c.eventId === ev.id).map(c => c.name);
-    return [ev.name, ev.type, ev.date, ev.location || "", attendees.length, attendees.join("; ")];
-  });
-  const ws3 = XLSX.utils.aoa_to_sheet([
-    ["Event", "Type", "Date", "Location", "Total Attendees", "Attendees"],
-    ...evRows,
-  ]);
-  ws3["!cols"] = [{wch:30},{wch:18},{wch:12},{wch:24},{wch:18},{wch:80}];
-  XLSX.utils.book_append_sheet(wb, ws3, "By Event");
+function openRollSheet(meetingId) {
+  const m = state.meetings.find(x => x.id === meetingId);
+  if (!m) return;
+  const attendees = state.attendance.filter(a => a.meetingId === meetingId);
+  const presentKeys = new Set(attendees.map(a => a.brotherKey));
+  const eligible = state.roster.filter(b => b.status === "Active" || b.status === "New Member");
 
-  // Sheet 4: Summary
-  const uniq = new Set(state.checkins.map(c => c.brotherKey || c.name.toLowerCase()));
-  const ws4 = XLSX.utils.aoa_to_sheet([
-    ["PIKE Chapter Attendance Report"],
-    ["Generated", new Date().toLocaleString()],
-    [],
-    ["Total Events", totalEv],
-    ["Total Check-Ins", state.checkins.length],
-    ["Unique Brothers Checked In", uniq.size],
-    ["Roster Size", state.roster.length],
-    ["Roster Reached", state.roster.length ? Math.round((uniq.size / state.roster.length) * 100) + "%" : "0%"],
-    ["Avg Check-Ins per Event", totalEv ? (state.checkins.length / totalEv).toFixed(1) : "0"],
-  ]);
-  ws4["!cols"] = [{wch:32},{wch:24}];
-  XLSX.utils.book_append_sheet(wb, ws4, "Summary");
+  const present = eligible.filter(b => presentKeys.has(b.key));
+  const absent  = eligible.filter(b => !presentKeys.has(b.key));
 
-  XLSX.writeFile(wb, `pike-attendance-${new Date().toISOString().slice(0, 10)}.xlsx`);
-  toast("Excel workbook exported");
-});
+  const sheet = $("roll-sheet-modal");
+  $("roll-sheet-title").textContent = m.title;
+  $("roll-sheet-meta").textContent =
+    `${fmtDateLong(m.date)} • ${fmtTime(m.startTime)}–${fmtTime(m.endTime)} • ${present.length} present, ${absent.length} not yet`;
+
+  $("roll-sheet-present").innerHTML = present.length
+    ? present.map(b => `<div style="padding: 8px 14px; border-bottom: 1px solid var(--light-gold); font-family: Georgia, serif; font-size: 13px; display: flex; justify-content: space-between;">
+        <span>${escapeHtml(b.firstName + " " + b.lastName)}</span>
+        <span style="font-family: Arial; font-size: 9px; letter-spacing: 1px; text-transform: uppercase; color: var(--garnet); font-weight: bold;">PRESENT</span>
+      </div>`).join("")
+    : `<div style="padding: 12px; font-family: Georgia, serif; font-style: italic; color: var(--true-gold);">No one has marked themselves present yet.</div>`;
+
+  $("roll-sheet-absent").innerHTML = absent.length
+    ? absent.map(b => `<div style="padding: 8px 14px; border-bottom: 1px solid var(--light-gold); font-family: Georgia, serif; font-size: 13px; display: flex; justify-content: space-between;">
+        <span>${escapeHtml(b.firstName + " " + b.lastName)}</span>
+        <span style="font-family: Arial; font-size: 9px; letter-spacing: 1px; text-transform: uppercase; color: var(--memphis-brick);">${b.status === "New Member" ? "NM" : ""} ${qrWindow(m).isPast ? "ABSENT" : "—"}</span>
+      </div>`).join("")
+    : `<div style="padding: 12px; font-family: Georgia, serif; font-style: italic; color: var(--true-gold);">Everyone eligible has marked present.</div>`;
+
+  sheet.classList.add("visible");
+}
 
 // ===================================================================
 // QR CODE MODAL
 // ===================================================================
-const qrModal = $("qr-modal");
-
-function renderQr(eventId) {
+function renderQr(meetingId) {
   $("qr-holder").innerHTML = "";
-  const url = window.location.origin + window.location.pathname + "#event=" + eventId;
+  const url = window.location.origin + window.location.pathname + "#meeting=" + meetingId;
   new QRCode($("qr-holder"), {
     text: url, width: 240, height: 240,
     colorDark: "#79242F", colorLight: "#ffffff",
@@ -738,53 +1392,1568 @@ function renderQr(eventId) {
   currentQrCanvas = $("qr-holder").querySelector("canvas") || $("qr-holder").querySelector("img");
 }
 
-function openQrModal(eventId) {
-  const ev = state.events.find(e => e.id === eventId);
-  if (!ev) return;
-  currentQrEvent = ev;
-  $("qr-event-name").textContent = ev.name;
-  $("qr-event-meta").textContent = ev.type + " • " + formatDate(ev.date) + (ev.location ? " • " + ev.location : "");
-  renderQr(eventId);
-  qrModal.classList.add("visible");
+function openQrModal(meetingId) {
+  const m = state.meetings.find(x => x.id === meetingId);
+  if (!m) return;
+  currentQrMeeting = m;
+  $("qr-meeting-title").textContent = m.title;
+  $("qr-meeting-meta").textContent =
+    `${fmtDateLong(m.date)} • ${fmtTime(m.startTime)} • ${m.location || ""}`;
+  renderQr(meetingId);
+  $("qr-modal").classList.add("visible");
 }
 
-$("qr-modal-close").addEventListener("click", () => qrModal.classList.remove("visible"));
-qrModal.addEventListener("click", (e) => {
-  if (e.target === qrModal) qrModal.classList.remove("visible");
+$("qr-modal-close").addEventListener("click", () => $("qr-modal").classList.remove("visible"));
+$("qr-modal").addEventListener("click", e => {
+  if (e.target === $("qr-modal")) $("qr-modal").classList.remove("visible");
 });
 $("qr-download").addEventListener("click", () => {
-  if (!currentQrCanvas || !currentQrEvent) return;
+  if (!currentQrCanvas || !currentQrMeeting) return;
   const a = document.createElement("a");
   a.href = currentQrCanvas.tagName === "CANVAS" ? currentQrCanvas.toDataURL("image/png") : currentQrCanvas.src;
-  a.download = `pike-qr-${currentQrEvent.name.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}.png`;
+  a.download = `pike-meeting-qr-${currentQrMeeting.title.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}.png`;
   a.click();
   toast("QR downloaded");
 });
 $("qr-copy-url").addEventListener("click", async () => {
-  if (!currentQrEvent) return;
-  const url = window.location.origin + window.location.pathname + "#event=" + currentQrEvent.id;
+  if (!currentQrMeeting) return;
+  const url = window.location.origin + window.location.pathname + "#meeting=" + currentQrMeeting.id;
   try { await navigator.clipboard.writeText(url); toast("URL copied"); }
-  catch { toast("Copy failed — select manually", true); }
+  catch { toast("Copy failed", true); }
+});
+
+// Roll Sheet modal close
+$("roll-sheet-close").addEventListener("click", () => $("roll-sheet-modal").classList.remove("visible"));
+$("roll-sheet-modal").addEventListener("click", e => {
+  if (e.target === $("roll-sheet-modal")) $("roll-sheet-modal").classList.remove("visible");
+});
+
+// Appeal modal handlers (Stage 4)
+$("appeal-modal-close").addEventListener("click", () => $("appeal-modal").classList.remove("visible"));
+$("appeal-cancel").addEventListener("click", () => $("appeal-modal").classList.remove("visible"));
+$("appeal-modal").addEventListener("click", e => {
+  if (e.target === $("appeal-modal")) $("appeal-modal").classList.remove("visible");
+});
+$("appeal-submit").addEventListener("click", submitAppeal);
+
+// Notification modal handler (Stage 5B) — acknowledge and show next
+$("notif-ack").addEventListener("click", async () => {
+  const id = $("notif-ack").dataset.id;
+  if (!id) return;
+  try {
+    await notifications.acknowledge(id);
+    // Show next pending (if any) — the subscription will re-fire and re-trigger showPendingNotifications
+    // But we close the current modal optimistically:
+    $("notif-modal").classList.remove("visible");
+  } catch (e) {
+    console.error(e);
+    toast("Could not acknowledge", true);
+  }
 });
 
 // ===================================================================
-// URL HASH ROUTING (#event=ID auto-selects after QR scan)
+// URL HASH ROUTING (#meeting=ID auto-opens Roll Call after QR scan)
 // ===================================================================
 function readHash() {
-  const m = window.location.hash.match(/event=([\w-]+)/);
+  const m = window.location.hash.match(/meeting=([\w-]+)/);
   return m ? m[1] : null;
 }
 window.addEventListener("hashchange", () => {
   const id = readHash();
   if (id) {
-    renderEventsListInChecklist(id);
-    activateTab("checkin");
+    activateTab("rollcall");
+    const meeting = state.meetings.find(x => x.id === id);
+    if (meeting) {
+      state.selectedQuarter = meeting.quarter;
+      document.querySelectorAll(".quarter-select").forEach(s => s.value = meeting.quarter);
+      renderAll();
+    }
   }
+});
+
+// ===================================================================
+// ABSENCE / REPORTS placeholders (Stages 3-5)
+// ===================================================================
+// ===================================================================
+// ABSENCE REQUESTS  (Stage 3)
+// ===================================================================
+//
+// Same "stable form, dynamic list" pattern as the Meetings tab — the
+// brother's submit form is built once per role state and never wiped,
+// so typing isn't lost when other Firestore data updates.
+//
+// Approver queue (cards) and "my requests" list re-render freely.
+// ===================================================================
+
+let _absenceFormBuiltFor = null;
+
+const REASON_LABELS = {
+  academic: "Academic (midterm, exam, paper)",
+  family:   "Family (event, emergency)",
+  medical:  "Medical (appointment, illness)",
+  work:     "Work (shift conflict)",
+  other:    "Other",
+};
+
+// Returns hours between now and a meeting's start time (negative if past)
+function hoursUntilMeeting(meeting) {
+  const w = qrWindow(meeting);
+  if (!w.start) return -Infinity;
+  return (w.start.getTime() - Date.now()) / (60 * 60 * 1000);
+}
+
+// Meetings eligible for an absence request: in the future AND >48hr away
+function eligibleMeetings() {
+  return state.meetings
+    .filter(m => hoursUntilMeeting(m) > 48)
+    .sort((a, b) => qrWindow(a).start - qrWindow(b).start);
+}
+
+// Meetings within 48 hours (not eligible — too late to request)
+function tooSoonMeetings() {
+  return state.meetings
+    .filter(m => {
+      const h = hoursUntilMeeting(m);
+      return h > 0 && h <= 48;
+    })
+    .sort((a, b) => qrWindow(a).start - qrWindow(b).start);
+}
+
+function renderAbsenceTab() {
+  const wrap = $("absence-content");
+  if (!wrap) return;
+
+  const isApprover = !!(state.user && state.user.isApprover);
+  const isSgt = !!(state.user && state.user.isSgt);
+  const isBrother = !!(state.user && state.user.rosterEntry);
+  const formKey = `${isApprover ? "approver" : "x"}|${isSgt ? "sgt" : "x"}|${isBrother ? "brother" : "x"}|${state.user?.email || "guest"}`;
+
+  if (_absenceFormBuiltFor !== formKey) {
+    wrap.innerHTML = `
+      ${isSgt ? `<div id="appeals-queue-container"></div>` : ""}
+      ${isApprover ? `<div id="approver-queue-container"></div>` : ""}
+      ${isBrother ? renderAbsenceFormShell() : ""}
+      <div id="my-requests-container"></div>
+      ${!isBrother && !isApprover && !isSgt ? renderAbsenceGuestState() : ""}
+    `;
+
+    if (isBrother) {
+      $("abs-submit")?.addEventListener("click", handleSubmitAbsenceRequest);
+      $("abs-meeting")?.addEventListener("change", updateAbsenceFormGuards);
+    }
+
+    _absenceFormBuiltFor = formKey;
+  }
+
+  // ----- Update dynamic portions (these can re-render freely) -----
+  if (isBrother) {
+    updateAbsenceMeetingDropdown();
+    updateAbsenceFormGuards();
+    renderMyRequestsList();
+  }
+  if (isApprover) {
+    renderApproverQueue();
+  }
+  if (isSgt) {
+    renderAppealsQueue();
+  }
+}
+
+function renderAbsenceGuestState() {
+  return `
+    <div class="card">
+      <div class="empty-coming-soon">
+        <h3>Sign in to submit absence requests</h3>
+        <p style="margin-top: 12px;">
+          Use your Gmail address (must match what's on the chapter roster).
+          Approvers and exec officers will see the review queue here.
+        </p>
+      </div>
+    </div>`;
+}
+
+// ----- Brother: submit form (built once, inputs preserved) -----
+function renderAbsenceFormShell() {
+  return `
+    <div class="card">
+      <div class="card-title">Request an Absence</div>
+      <div class="card-sub">Submit at least 48 hours before the meeting</div>
+
+      <label for="abs-meeting">Which Meeting</label>
+      <select id="abs-meeting"></select>
+      <div id="abs-too-soon-hint" style="display: none;"></div>
+
+      <div id="abs-form-body">
+        <label for="abs-reason">Reason</label>
+        <select id="abs-reason">
+          <option value="academic">${REASON_LABELS.academic}</option>
+          <option value="family">${REASON_LABELS.family}</option>
+          <option value="medical">${REASON_LABELS.medical}</option>
+          <option value="work">${REASON_LABELS.work}</option>
+          <option value="other">${REASON_LABELS.other}</option>
+        </select>
+
+        <label for="abs-description">
+          Details
+          <span style="font-weight: normal; text-transform: none; letter-spacing: 0; color: var(--true-gold); font-style: italic; margin-left: 6px;">
+            (be specific — at least one full sentence)
+          </span>
+        </label>
+        <textarea id="abs-description" rows="4" placeholder="Example: I have a CS35L midterm from 7-9pm Tuesday in Boelter Hall. The professor confirmed makeups aren't allowed." autocomplete="off"></textarea>
+        <div class="help" style="margin-top: 4px;">
+          Have written proof? Email it directly to the secretary.
+        </div>
+
+        <div id="abs-mandatory-warning" style="display: none;"></div>
+
+        <button class="btn" id="abs-submit">Submit Request</button>
+      </div>
+
+      <div id="abs-too-soon-message" style="display: none;"></div>
+    </div>
+  `;
+}
+
+function updateAbsenceMeetingDropdown() {
+  const sel = $("abs-meeting");
+  if (!sel) return;
+
+  const eligible = eligibleMeetings();
+  const previousValue = sel.value;
+
+  if (eligible.length === 0) {
+    sel.innerHTML = `<option value="">No upcoming meetings &gt;48 hours away</option>`;
+    sel.disabled = true;
+  } else {
+    sel.disabled = false;
+    sel.innerHTML = eligible.map(m => {
+      const hrs = Math.round(hoursUntilMeeting(m));
+      const days = Math.round(hrs / 24);
+      const when = hrs < 48 ? `${hrs}hr away`
+                  : days < 7 ? `${days} day${days === 1 ? "" : "s"} away`
+                  : `${fmtDate(m.date)}`;
+      const mand = m.mandatory ? " ⚑ MANDATORY" : "";
+      return `<option value="${m.id}">${escapeHtml(m.title)} — ${when}${mand}</option>`;
+    }).join("");
+
+    // Preserve user's selection across re-renders if still valid
+    if (previousValue && eligible.some(m => m.id === previousValue)) {
+      sel.value = previousValue;
+    }
+  }
+
+  // Show "too soon" hint if applicable
+  const tooSoon = tooSoonMeetings();
+  const hint = $("abs-too-soon-hint");
+  if (hint) {
+    if (tooSoon.length > 0) {
+      const secEmail = state.settings.secretaryEmail || SECRETARY_EMAIL;
+      hint.style.display = "block";
+      hint.style.cssText = "margin-top: 8px; padding: 10px 14px; background: var(--khaki); border-left: 3px solid var(--burgundy); font-family: Georgia, serif; font-size: 12px; font-style: italic;";
+      const list = tooSoon.map(m => `<strong>${escapeHtml(m.title)}</strong> (${fmtDate(m.date)} at ${fmtTime(m.startTime)})`).join(", ");
+      hint.innerHTML = `${tooSoon.length} meeting${tooSoon.length === 1 ? " is" : "s are"} less than 48 hours away (${list}). For those, contact the secretary directly: <a href="mailto:${secEmail}" style="color: var(--garnet); font-weight: bold;">${secEmail}</a>`;
+    } else {
+      hint.style.display = "none";
+    }
+  }
+}
+
+function updateAbsenceFormGuards() {
+  const sel = $("abs-meeting");
+  const formBody = $("abs-form-body");
+  const tooSoonMsg = $("abs-too-soon-message");
+  const mandWarn = $("abs-mandatory-warning");
+  if (!sel || !formBody || !tooSoonMsg || !mandWarn) return;
+
+  const meetingId = sel.value;
+  const meeting = state.meetings.find(m => m.id === meetingId);
+  const eligible = eligibleMeetings();
+
+  // Edge case: no eligible meetings at all
+  if (eligible.length === 0) {
+    formBody.style.display = "none";
+    const secEmail = state.settings.secretaryEmail || SECRETARY_EMAIL;
+    tooSoonMsg.style.display = "block";
+    tooSoonMsg.style.cssText = "display: block; margin-top: 18px; padding: 18px; background: var(--khaki); border-left: 3px solid var(--burgundy);";
+    tooSoonMsg.innerHTML = `
+      <div style="font-family: 'Cormorant Garamond', Georgia, serif; font-size: 18px; color: var(--burgundy); font-weight: 600;">
+        No meetings eligible for absence requests
+      </div>
+      <div style="font-family: Georgia, serif; font-size: 14px; line-height: 1.6; margin-top: 8px;">
+        All upcoming meetings are within 48 hours, or none are scheduled. For urgent excused absences, contact the secretary directly:
+        <a href="mailto:${secEmail}" style="color: var(--garnet); font-weight: bold;">${secEmail}</a>
+      </div>`;
+    return;
+  }
+
+  formBody.style.display = "";
+  tooSoonMsg.style.display = "none";
+
+  // Mandatory warning
+  if (meeting && meeting.mandatory) {
+    mandWarn.style.display = "block";
+    mandWarn.style.cssText = "display: block; margin-top: 14px; padding: 12px 14px; background: var(--light-gold); border-left: 3px solid var(--burgundy); font-family: Georgia, serif; font-size: 13px; line-height: 1.5;";
+    mandWarn.innerHTML = `
+      <strong style="color: var(--burgundy);">⚑ This is a mandatory meeting.</strong>
+      Bylaws require attendance unless explicitly excused by exec. You can submit, but it'll likely be denied unless you've already gotten verbal approval from a President / IVP / Secretary.`;
+  } else {
+    mandWarn.style.display = "none";
+  }
+}
+
+async function handleSubmitAbsenceRequest() {
+  if (!state.user || !state.user.rosterEntry) {
+    return toast("You need to be in the chapter roster to submit", true);
+  }
+
+  const meetingId   = $("abs-meeting").value;
+  const reason      = $("abs-reason").value;
+  const description = $("abs-description").value.trim();
+
+  if (!meetingId)  return toast("Pick a meeting", true);
+  if (!reason)     return toast("Pick a reason", true);
+  if (description.length < 20) return toast("Be more specific in the description (20+ characters)", true);
+
+  const meeting = state.meetings.find(m => m.id === meetingId);
+  if (!meeting) return toast("Meeting not found — refresh", true);
+  if (hoursUntilMeeting(meeting) <= 48) {
+    const secEmail = state.settings.secretaryEmail || SECRETARY_EMAIL;
+    return toast(`Less than 48hr away — contact ${secEmail} directly`, true);
+  }
+
+  // Check for duplicate (same brother, same meeting, still pending or approved)
+  const target = state.user.rosterEntry;
+  const existing = state.absenceRequests.find(r =>
+    r.meetingId === meetingId &&
+    r.brotherKey === target.key &&
+    (r.status === "pending" || r.status === "approved")
+  );
+  if (existing) {
+    return toast("You already have a request for this meeting", true);
+  }
+
+  try {
+    await absenceRequests.submit({
+      meetingId,
+      brotherKey: target.key,
+      brotherName: `${target.firstName} ${target.lastName}`,
+      email: target.email,
+      reason,
+      description,
+      meetingTitle: meeting.title,
+      meetingDate: meeting.date,
+      meetingStartTime: meeting.startTime,
+      mandatory: !!meeting.mandatory,
+      quarter: meeting.quarter,
+    });
+    toast("Request submitted — approvers will review");
+    // Clear form (but only the parts we want to clear; keep the meeting selected for context)
+    $("abs-description").value = "";
+  } catch (e) {
+    console.error(e);
+    toast("Could not submit — check connection", true);
+  }
+}
+
+// ----- Brother: their own requests list (re-renders freely) -----
+function renderMyRequestsList() {
+  const wrap = $("my-requests-container");
+  if (!wrap) return;
+
+  const target = state.user?.rosterEntry;
+  if (!target) {
+    wrap.innerHTML = "";
+    return;
+  }
+
+  const myReqs = state.absenceRequests
+    .filter(r => r.brotherKey === target.key)
+    .filter(inQuarter)
+    .sort((a, b) => (b.submittedAt || 0) - (a.submittedAt || 0));
+
+  if (myReqs.length === 0) {
+    wrap.innerHTML = `
+      <div class="card">
+        <div class="card-title">My Requests</div>
+        <div class="card-sub">${formatQuarter(state.selectedQuarter)}</div>
+        <div class="empty">You haven't submitted any absence requests this quarter.</div>
+      </div>`;
+    return;
+  }
+
+  const pending  = myReqs.filter(r => r.status === "pending").length;
+  const approved = myReqs.filter(r => r.status === "approved").length;
+  const denied   = myReqs.filter(r => r.status === "denied").length;
+
+  wrap.innerHTML = `
+    <div class="card">
+      <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 14px;">
+        <div>
+          <div class="card-title">My Requests</div>
+          <div class="card-sub">${formatQuarter(state.selectedQuarter)} &middot; ${pending} pending, ${approved} approved, ${denied} denied</div>
+        </div>
+      </div>
+      <div style="display: flex; flex-direction: column; gap: 10px; margin-top: 14px;">
+        ${myReqs.map(r => renderMyRequestRow(r)).join("")}
+      </div>
+    </div>`;
+
+  wrap.querySelectorAll("[data-cancel]").forEach(b => {
+    b.addEventListener("click", () => handleCancelRequest(b.dataset.cancel));
+  });
+}
+
+function renderMyRequestRow(r) {
+  const submittedAgo = r.submittedAt ? relativeTime(r.submittedAt) : "—";
+  const statusColor = r.status === "approved" ? "var(--garnet)"
+                     : r.status === "denied"   ? "var(--memphis-brick)"
+                     : "var(--true-gold)";
+  const statusLabel = r.status === "approved" ? "APPROVED"
+                     : r.status === "denied"   ? "DENIED"
+                     : "PENDING";
+
+  return `
+    <div style="padding: 14px 18px; background: white; border: 1px solid rgba(170,151,103,0.3); border-left: 3px solid ${statusColor};">
+      <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 14px; flex-wrap: wrap;">
+        <div style="flex: 1; min-width: 220px;">
+          <div style="font-family: 'Cormorant Garamond', Georgia, serif; font-size: 17px; font-weight: 600; color: var(--garnet);">
+            ${escapeHtml(r.meetingTitle || "Meeting")}
+          </div>
+          <div style="font-family: Arial, sans-serif; font-size: 11px; color: var(--slate); margin-top: 3px;">
+            ${escapeHtml(fmtDate(r.meetingDate))} &middot; ${fmtTime(r.meetingStartTime)} &middot; ${escapeHtml(REASON_LABELS[r.reason] || r.reason)}
+          </div>
+          <div style="font-family: Georgia, serif; font-size: 13px; color: var(--slate); margin-top: 8px; line-height: 1.5;">
+            ${escapeHtml(r.description)}
+          </div>
+          ${r.reviewerNote ? `
+            <div style="margin-top: 8px; padding: 8px 12px; background: var(--light-gold); font-family: Georgia, serif; font-size: 12px; font-style: italic;">
+              <strong style="font-style: normal; color: var(--garnet);">Approver note:</strong> ${escapeHtml(r.reviewerNote)}
+            </div>
+          ` : ""}
+          <div style="font-family: Arial, sans-serif; font-size: 10px; color: var(--knight-steel); margin-top: 8px; letter-spacing: 1px;">
+            Submitted ${submittedAgo}
+          </div>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 8px; align-items: flex-end;">
+          <span style="background: ${statusColor}; color: white; padding: 4px 10px; font-family: Arial; font-size: 10px; font-weight: bold; letter-spacing: 1.5px;">
+            ${statusLabel}
+          </span>
+          ${r.status === "pending"
+            ? `<button class="btn btn-ghost btn-small" data-cancel="${r.id}">Cancel</button>`
+            : ""}
+        </div>
+      </div>
+    </div>`;
+}
+
+async function handleCancelRequest(id) {
+  if (!confirm("Cancel this absence request? You can re-submit before the 48-hour cutoff.")) return;
+  try {
+    await absenceRequests.cancel(id);
+    toast("Request cancelled");
+  } catch (e) {
+    console.error(e);
+    toast("Cancel failed — try again", true);
+  }
+}
+
+// ----- Approver queue -----
+function renderApproverQueue() {
+  const wrap = $("approver-queue-container");
+  if (!wrap) return;
+
+  const pending = state.absenceRequests
+    .filter(r => r.status === "pending")
+    .sort((a, b) => {
+      // Sort by meeting date (most urgent first)
+      const aTime = combineLocalDateTime(a.meetingDate, a.meetingStartTime)?.getTime() || Infinity;
+      const bTime = combineLocalDateTime(b.meetingDate, b.meetingStartTime)?.getTime() || Infinity;
+      return aTime - bTime;
+    });
+
+  const recentlyReviewed = state.absenceRequests
+    .filter(r => r.status !== "pending")
+    .filter(inQuarter)
+    .sort((a, b) => (b.reviewedAt || 0) - (a.reviewedAt || 0))
+    .slice(0, 10);
+
+  wrap.innerHTML = `
+    <div class="card">
+      <div class="card-title">Pending Review</div>
+      <div class="card-sub">${pending.length} request${pending.length === 1 ? "" : "s"} awaiting decision</div>
+
+      ${pending.length === 0
+        ? `<div class="empty">No pending requests right now.</div>`
+        : `<div style="display: flex; flex-direction: column; gap: 14px; margin-top: 14px;">
+            ${pending.map(r => renderApproverCard(r)).join("")}
+          </div>`}
+    </div>
+
+    ${recentlyReviewed.length > 0 ? `
+      <div class="card">
+        <div class="card-title" style="font-size: 18px;">Recently Reviewed</div>
+        <div class="card-sub">Last 10 decisions this quarter</div>
+        <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 14px;">
+          ${recentlyReviewed.map(r => renderReviewedRow(r)).join("")}
+        </div>
+      </div>
+    ` : ""}
+  `;
+
+  wrap.querySelectorAll("[data-approve]").forEach(b =>
+    b.addEventListener("click", () => handleReviewDecision(b.dataset.approve, "approved")));
+  wrap.querySelectorAll("[data-deny]").forEach(b =>
+    b.addEventListener("click", () => handleReviewDecision(b.dataset.deny, "denied")));
+}
+
+function renderApproverCard(r) {
+  const submittedAgo = r.submittedAt ? relativeTime(r.submittedAt) : "—";
+  const meetingTime = combineLocalDateTime(r.meetingDate, r.meetingStartTime);
+  const meetingAway = meetingTime ? relativeTime(meetingTime) : "—";
+
+  return `
+    <div style="padding: 18px 20px; background: white; border: 1px solid rgba(170,151,103,0.3); ${r.mandatory ? "border-left: 3px solid var(--burgundy);" : "border-left: 3px solid var(--true-gold);"}">
+      <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 12px;">
+        <div style="flex: 1; min-width: 200px;">
+          <div style="font-family: 'Cormorant Garamond', Georgia, serif; font-size: 19px; font-weight: 600; color: var(--garnet);">
+            ${escapeHtml(r.brotherName)} ${r.mandatory ? `<span style="font-family: Arial; font-size: 10px; letter-spacing: 1.5px; color: var(--burgundy); margin-left: 6px;">⚑ MANDATORY MTG</span>` : ""}
+          </div>
+          <div style="font-family: Arial, sans-serif; font-size: 11px; color: var(--slate); letter-spacing: 0.5px; margin-top: 3px;">
+            ${escapeHtml(r.meetingTitle || "Meeting")} &middot; ${escapeHtml(fmtDate(r.meetingDate))} ${fmtTime(r.meetingStartTime)} (${meetingAway})
+          </div>
+        </div>
+        <span style="background: var(--khaki); color: var(--burgundy); padding: 3px 9px; font-family: Arial; font-size: 9px; font-weight: bold; letter-spacing: 1.5px;">
+          ${escapeHtml((r.reason || "OTHER").toUpperCase())}
+        </span>
+      </div>
+
+      <div style="font-family: Georgia, serif; font-size: 14px; color: var(--slate); margin-top: 12px; line-height: 1.55; padding: 12px 14px; background: var(--paper); border-left: 2px solid var(--key-gold);">
+        ${escapeHtml(r.description)}
+      </div>
+
+      <div style="margin-top: 14px;">
+        <label for="abs-note-${r.id}" style="margin: 0 0 4px;">Note <span style="font-weight: normal; text-transform: none; letter-spacing: 0; color: var(--true-gold); font-style: italic;">(optional, brother sees this)</span></label>
+        <input type="text" id="abs-note-${r.id}" placeholder="e.g. 'Approved — please email proof to secretary'" autocomplete="off">
+      </div>
+
+      <div style="display: flex; gap: 10px; margin-top: 14px; align-items: center; flex-wrap: wrap;">
+        <button class="btn" data-approve="${r.id}">Approve</button>
+        <button class="btn btn-danger" data-deny="${r.id}">Deny</button>
+        <span style="flex: 1; text-align: right; font-family: Arial; font-size: 10px; color: var(--knight-steel); letter-spacing: 1px;">
+          Submitted ${submittedAgo} by ${escapeHtml(r.email || "")}
+        </span>
+      </div>
+    </div>`;
+}
+
+function renderReviewedRow(r) {
+  const color = r.status === "approved" ? "var(--garnet)" : "var(--memphis-brick)";
+  const reviewerShort = (r.reviewedBy || "").split("@")[0];
+  return `
+    <div style="padding: 10px 14px; background: white; border-left: 3px solid ${color}; font-family: Georgia, serif; font-size: 13px; display: flex; justify-content: space-between; align-items: center; gap: 14px; flex-wrap: wrap;">
+      <div>
+        <strong style="color: ${color};">${(r.status || "").toUpperCase()}</strong>
+        &middot; ${escapeHtml(r.brotherName)}
+        &middot; ${escapeHtml(r.meetingTitle || "Meeting")}
+        &middot; <span style="color: var(--knight-steel); font-size: 12px;">${escapeHtml(REASON_LABELS[r.reason] || r.reason)}</span>
+      </div>
+      <span style="font-family: Arial; font-size: 10px; color: var(--knight-steel); letter-spacing: 1px;">
+        by ${escapeHtml(reviewerShort)} ${r.reviewedAt ? relativeTime(r.reviewedAt) : ""}
+      </span>
+    </div>`;
+}
+
+async function handleReviewDecision(id, decision) {
+  if (!state.user || !state.user.isApprover) {
+    return toast("Only approvers can decide", true);
+  }
+  const req = state.absenceRequests.find(r => r.id === id);
+  const noteInput = $(`abs-note-${id}`);
+  const note = noteInput ? noteInput.value.trim() : "";
+  try {
+    await absenceRequests.review(id, decision, note);
+    toast(`Request ${decision}`);
+
+    // Notify the brother of the decision
+    if (req && req.email) {
+      const decisionLabel = decision === "approved" ? "Absence Approved" : "Absence Denied";
+      const tone = decision === "approved" ? "info" : "warning";
+      const body = decision === "approved"
+        ? `Your absence request for ${req.meetingTitle || "the meeting"} on ${fmtDate(req.meetingDate || "")} has been approved.${note ? ` Note: "${note}"` : ""}`
+        : `Your absence request for ${req.meetingTitle || "the meeting"} on ${fmtDate(req.meetingDate || "")} has been denied.${note ? ` Reason: "${note}"` : ""} If you don't attend, you'll get a no-show.`;
+      await notify(req.email, "absence_decision", decisionLabel, body, tone, id);
+    }
+  } catch (e) {
+    console.error(e);
+    toast("Review failed — try again", true);
+  }
+}
+
+// ===================================================================
+// STAGE 4 — APPEALS QUEUE  (Sgt-at-Arms reviews)
+// ===================================================================
+
+function renderAppealsQueue() {
+  const wrap = $("appeals-queue-container");
+  if (!wrap) return;
+
+  const pendingAppeals = state.noShows
+    .filter(n => n.appealed && n.appealStatus === "pending")
+    .filter(inQuarter)
+    .sort((a, b) => (a.appealedAt || 0) - (b.appealedAt || 0));
+
+  const recentAppeals = state.noShows
+    .filter(n => n.appealed && n.appealStatus !== "pending")
+    .filter(inQuarter)
+    .sort((a, b) => (b.appealResolvedAt || 0) - (a.appealResolvedAt || 0))
+    .slice(0, 10);
+
+  if (pendingAppeals.length === 0 && recentAppeals.length === 0) {
+    wrap.innerHTML = "";
+    return;
+  }
+
+  wrap.innerHTML = `
+    ${pendingAppeals.length > 0 ? `
+      <div class="card judicial">
+        <div class="card-title">No-Show Appeals</div>
+        <div class="card-sub">${pendingAppeals.length} pending &middot; Sgt-at-Arms decides</div>
+        <div style="display: flex; flex-direction: column; gap: 14px; margin-top: 14px;">
+          ${pendingAppeals.map(n => renderAppealCard(n)).join("")}
+        </div>
+      </div>` : ""}
+
+    ${recentAppeals.length > 0 ? `
+      <div class="card">
+        <div class="card-title" style="font-size: 18px;">Recent Appeals</div>
+        <div class="card-sub">Last 10 decisions</div>
+        <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 14px;">
+          ${recentAppeals.map(n => renderAppealReviewedRow(n)).join("")}
+        </div>
+      </div>` : ""}
+  `;
+
+  wrap.querySelectorAll("[data-overturn]").forEach(b =>
+    b.addEventListener("click", () => handleAppealDecision(b.dataset.overturn, "overturned")));
+  wrap.querySelectorAll("[data-uphold]").forEach(b =>
+    b.addEventListener("click", () => handleAppealDecision(b.dataset.uphold, "upheld")));
+}
+
+function renderAppealCard(n) {
+  const submittedAgo = n.appealedAt ? relativeTime(n.appealedAt) : "—";
+  const sequence = ["1st", "2nd", "3rd", "4th+"][Math.min(n.count - 1, 3)] || "";
+  return `
+    <div style="padding: 18px 20px; background: white; border: 1px solid rgba(170,151,103,0.3); border-left: 3px solid var(--dagger);">
+      <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 12px;">
+        <div style="flex: 1; min-width: 200px;">
+          <div style="font-family: 'Cormorant Garamond', Georgia, serif; font-size: 19px; font-weight: 600; color: var(--dagger);">
+            ${escapeHtml(n.brotherName)}
+          </div>
+          <div style="font-family: Arial, sans-serif; font-size: 11px; color: var(--slate); letter-spacing: 0.5px; margin-top: 3px;">
+            ${sequence} no-show &middot; ${escapeHtml(n.meetingTitle || "Meeting")} &middot; ${escapeHtml(fmtDate(n.meetingDate || ""))}
+          </div>
+          <div style="font-family: Arial, sans-serif; font-size: 10px; color: var(--knight-steel); margin-top: 3px; font-style: italic;">
+            ${escapeHtml(noShowReasonLabel(n.reason))}
+          </div>
+        </div>
+      </div>
+
+      <div style="font-family: Georgia, serif; font-size: 14px; color: var(--slate); margin-top: 12px; line-height: 1.55; padding: 12px 14px; background: var(--paper); border-left: 2px solid var(--key-gold);">
+        <div style="font-family: Arial, sans-serif; font-size: 10px; letter-spacing: 1.5px; text-transform: uppercase; color: var(--garnet); font-weight: bold; margin-bottom: 4px;">Appeal reason</div>
+        ${escapeHtml(n.appealReason || "")}
+      </div>
+
+      <div style="margin-top: 14px;">
+        <label for="appeal-note-${n.id}" style="margin: 0 0 4px;">Note <span style="font-weight: normal; text-transform: none; letter-spacing: 0; color: var(--true-gold); font-style: italic;">(brother sees this)</span></label>
+        <input type="text" id="appeal-note-${n.id}" placeholder="e.g. 'Overturned — confirmed with health center'" autocomplete="off">
+      </div>
+
+      <div style="display: flex; gap: 10px; margin-top: 14px; align-items: center; flex-wrap: wrap;">
+        <button class="btn" data-overturn="${n.id}">Overturn (remove no-show)</button>
+        <button class="btn btn-danger" data-uphold="${n.id}">Uphold (no-show stands)</button>
+        <span style="flex: 1; text-align: right; font-family: Arial; font-size: 10px; color: var(--knight-steel); letter-spacing: 1px;">
+          Appealed ${submittedAgo}
+        </span>
+      </div>
+    </div>`;
+}
+
+function renderAppealReviewedRow(n) {
+  const color = n.appealStatus === "overturned" ? "var(--garnet)" : "var(--memphis-brick)";
+  const reviewerShort = (n.appealResolvedBy || "").split("@")[0];
+  return `
+    <div style="padding: 10px 14px; background: white; border-left: 3px solid ${color}; font-family: Georgia, serif; font-size: 13px; display: flex; justify-content: space-between; align-items: center; gap: 14px; flex-wrap: wrap;">
+      <div>
+        <strong style="color: ${color};">${(n.appealStatus || "").toUpperCase()}</strong>
+        &middot; ${escapeHtml(n.brotherName)}
+        &middot; ${escapeHtml(n.meetingTitle || "Meeting")}
+      </div>
+      <span style="font-family: Arial; font-size: 10px; color: var(--knight-steel); letter-spacing: 1px;">
+        by ${escapeHtml(reviewerShort)} ${n.appealResolvedAt ? relativeTime(n.appealResolvedAt) : ""}
+      </span>
+    </div>`;
+}
+
+async function handleAppealDecision(id, decision) {
+  if (!state.user || (!state.user.isSgt && !state.user.isExec)) {
+    return toast("Only Sgt-at-Arms can resolve appeals", true);
+  }
+  const ns = state.noShows.find(n => n.id === id);
+  const noteInput = $(`appeal-note-${id}`);
+  const note = noteInput ? noteInput.value.trim() : "";
+  try {
+    await noShows.resolveAppeal(id, decision, note);
+
+    // If overturned, remove any associated fine
+    if (decision === "overturned" && ns) {
+      const associatedFine = state.fines.find(f =>
+        f.brotherKey === ns.brotherKey &&
+        f.meetingId === ns.meetingId &&
+        f.status === "pending"
+      );
+      if (associatedFine) {
+        try {
+          await fines.waive(associatedFine.id, "Appeal overturned no-show");
+        } catch (e) { console.warn("Could not waive associated fine:", e); }
+      }
+    }
+    toast(`Appeal ${decision}`);
+
+    // Notify the brother of the appeal outcome
+    if (ns && ns.email) {
+      const decisionLabel = decision === "overturned" ? "Appeal Overturned ✓" : "Appeal Denied";
+      const body = decision === "overturned"
+        ? `Your appeal of the no-show for ${ns.meetingTitle || "the meeting"} has been overturned. Any associated fine has been waived.${note ? ` Sgt note: "${note}"` : ""}`
+        : `Your appeal of the no-show for ${ns.meetingTitle || "the meeting"} was denied. The no-show stands.${note ? ` Sgt note: "${note}"` : ""}`;
+      const tone = decision === "overturned" ? "info" : "warning";
+      await notify(ns.email, "appeal_resolved", decisionLabel, body, tone, id);
+    }
+  } catch (e) {
+    console.error(e);
+    toast("Could not resolve appeal", true);
+  }
+}
+
+// ===================================================================
+// REPORTS TAB  (Stage 4 — treasurer fine ledger; Stage 5 will add more)
+// ===================================================================
+
+function renderReportsTab() {
+  const wrap = $("reports-content");
+  if (!wrap) return;
+
+  const isExec = !!(state.user && state.user.isExec);
+  const isTreasurer = !!(state.user && state.user.isTreasurer);
+
+  if (!isExec && !isTreasurer) {
+    wrap.innerHTML = `
+      <div class="card">
+        <div class="empty-coming-soon">
+          <h3>Exec Reports</h3>
+          <p style="margin-top: 12px;">This area is for exec officers only.</p>
+        </div>
+      </div>`;
+    return;
+  }
+
+  // Filter to selected quarter
+  const pendingFines = state.fines.filter(f => f.status === "pending").filter(inQuarter);
+  const paidFines    = state.fines.filter(f => f.status === "paid").filter(inQuarter);
+  const waivedFines  = state.fines.filter(f => f.status === "waived").filter(inQuarter);
+
+  const pendingTotal = pendingFines.reduce((sum, f) => sum + (Number(f.amount) || 0), 0);
+  const paidTotal    = paidFines.reduce((sum, f) => sum + (Number(f.amount) || 0), 0);
+
+  // Sort by date descending
+  const sortByDate = (a, b) => (b.createdAt || 0) - (a.createdAt || 0);
+  pendingFines.sort(sortByDate);
+  paidFines.sort(sortByDate);
+
+  wrap.innerHTML = `
+    <div class="card danger">
+      <div class="card-title">Treasurer's Fine Ledger</div>
+      <div class="card-sub">${formatQuarter(state.selectedQuarter)} &middot; ${pendingFines.length} pending, ${paidFines.length} collected</div>
+
+      <div class="standing-grid" style="margin-top: 14px;">
+        <div class="standing-tile fines">
+          <div class="num">$${pendingTotal}</div>
+          <div class="label">Outstanding</div>
+          <div class="sub">${pendingFines.length} brother${pendingFines.length === 1 ? "" : "s"}</div>
+        </div>
+        <div class="standing-tile absences">
+          <div class="num">$${paidTotal}</div>
+          <div class="label">Collected</div>
+          <div class="sub">${paidFines.length} fine${paidFines.length === 1 ? "" : "s"}</div>
+        </div>
+        <div class="standing-tile no-shows">
+          <div class="num">${waivedFines.length}</div>
+          <div class="label">Waived</div>
+          <div class="sub">via appeal</div>
+        </div>
+        <div class="standing-tile standing">
+          <div class="num">$${pendingTotal + paidTotal}</div>
+          <div class="label">Total Levied</div>
+          <div class="sub">this quarter</div>
+        </div>
+      </div>
+
+      ${pendingFines.length === 0
+        ? `<div class="empty" style="margin-top: 18px;">No outstanding fines.</div>`
+        : `<div style="margin-top: 22px;">
+            <div style="font-family: 'Cormorant Garamond', Georgia, serif; font-size: 18px; font-weight: 600; color: var(--memphis-brick); margin-bottom: 10px;">
+              Pending Collection
+            </div>
+            <div style="display: flex; flex-direction: column; gap: 8px;">
+              ${pendingFines.map(f => renderFineRow(f, "pending")).join("")}
+            </div>
+          </div>`}
+
+      ${paidFines.length > 0 ? `
+        <div style="margin-top: 22px;">
+          <div style="font-family: 'Cormorant Garamond', Georgia, serif; font-size: 16px; font-weight: 600; color: var(--garnet); margin-bottom: 10px;">
+            Collected (Paid)
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 6px;">
+            ${paidFines.slice(0, 20).map(f => renderFineRow(f, "paid")).join("")}
+          </div>
+        </div>` : ""}
+    </div>
+
+    <div class="card judicial">
+      <div class="card-title">&lt;50% Participation Watchlist</div>
+      <div class="card-sub">Article VI §12 &middot; Combined meetings + chapter events &middot; ${formatQuarter(state.selectedQuarter)}</div>
+      ${renderWatchlistSection()}
+    </div>
+
+    ${(isExec || (state.user && state.user.isSgt)) ? `
+      <div class="card">
+        <div class="card-title">Pending Acknowledgments</div>
+        <div class="card-sub">Notifications brothers haven't seen yet &middot; Follow up if urgent</div>
+        ${renderPendingAcksSection()}
+      </div>
+    ` : ""}
+
+    <div class="card">
+      <div class="card-title">Excel Reports</div>
+      <div class="card-sub">Download as .xlsx &middot; Filtered to ${formatQuarter(state.selectedQuarter)}</div>
+      <p style="font-family: Georgia, serif; font-size: 13px; line-height: 1.5; color: var(--slate); margin-top: 8px; margin-bottom: 14px;">
+        Each export pulls live data for the selected quarter. Hand to chapter standards / Sgt-at-Arms / treasurer / secretary as appropriate.
+      </p>
+      <div style="display: flex; flex-wrap: wrap; gap: 10px;">
+        <button class="btn btn-ghost btn-small" data-export="attendance">Quarterly Attendance per Brother</button>
+        <button class="btn btn-ghost btn-small" data-export="noshows">No-Show Ledger</button>
+        <button class="btn btn-ghost btn-small" data-export="fines">Fine Ledger (Treasurer)</button>
+        <button class="btn btn-ghost btn-small" data-export="absences">Absence Request History</button>
+        <button class="btn btn-ghost btn-small" data-export="combined">Combined Participation Report</button>
+      </div>
+    </div>
+  `;
+
+  wrap.querySelectorAll("[data-paid]").forEach(b =>
+    b.addEventListener("click", () => handleMarkFinePaid(b.dataset.paid)));
+  wrap.querySelectorAll("[data-waive]").forEach(b =>
+    b.addEventListener("click", () => handleWaiveFine(b.dataset.waive)));
+  wrap.querySelectorAll("[data-export]").forEach(b =>
+    b.addEventListener("click", () => exportReport(b.dataset.export)));
+}
+
+// ===================================================================
+// STAGE 5 — PARTICIPATION WATCHLIST + EXCEL EXPORTS
+// ===================================================================
+
+// Per-brother participation data for the selected quarter.
+// Combines meetings (this app) + chapter events (event tracker collection).
+function computeParticipation() {
+  const eligible = state.roster.filter(brotherIsEligible);
+  const q = state.selectedQuarter;
+
+  // Meetings in quarter
+  const meetingsInQ = state.meetings.filter(m => q === "all" || m.quarter === q);
+  const meetingAttIn = state.attendance.filter(a => q === "all" || a.quarter === q);
+
+  // Events in quarter (from event tracker collection)
+  // Event tracker doesn't always stamp `quarter` on events, so derive from date if missing
+  const eventsInQ = state.events.filter(e => {
+    if (q === "all") return true;
+    if (e.quarter) return e.quarter === q;
+    if (!e.date) return false;
+    const [y, m] = e.date.split("-").map(Number);
+    const month = m - 1;
+    let derived;
+    if (month <= 2)      derived = `${y}-winter`;
+    else if (month <= 5) derived = `${y}-spring`;
+    else if (month <= 7) derived = `${y}-summer`;
+    else                 derived = `${y}-fall`;
+    return derived === q;
+  });
+  const eventCheckinsIn = state.checkins.filter(c => {
+    // Event tracker may stamp `quarter` or only `eventId`. Look up the event if needed.
+    if (q === "all") return true;
+    if (c.quarter) return c.quarter === q;
+    const ev = eventsInQ.find(e => e.id === c.eventId);
+    return !!ev;
+  });
+
+  return eligible.map(b => {
+    const mAttended = meetingAttIn.filter(a => a.brotherKey === b.key).length;
+    const eAttended = eventCheckinsIn.filter(c => c.brotherKey === b.key).length;
+    const totalEvents = meetingsInQ.length + eventsInQ.length;
+    const totalAttended = mAttended + eAttended;
+    const ratio = totalEvents > 0 ? totalAttended / totalEvents : 1;
+
+    const myNS  = state.noShows.filter(n => n.brotherKey === b.key && (q === "all" || n.quarter === q) && n.appealStatus !== "overturned");
+    const myAbs = state.absenceRequests.filter(r => r.brotherKey === b.key && (q === "all" || r.quarter === q));
+    const myFines = state.fines.filter(f => f.brotherKey === b.key && (q === "all" || f.quarter === q));
+
+    return {
+      brother: b,
+      meetingsAttended: mAttended,
+      meetingsTotal: meetingsInQ.length,
+      eventsAttended: eAttended,
+      eventsTotal: eventsInQ.length,
+      totalAttended,
+      totalEvents,
+      ratio,
+      onWatchlist: totalEvents >= 3 && ratio < 0.5,
+      noShows: myNS.length,
+      absencesApproved: myAbs.filter(r => r.status === "approved").length,
+      finesPending: myFines.filter(f => f.status === "pending").reduce((s, f) => s + Number(f.amount || 0), 0),
+      finesPaid:    myFines.filter(f => f.status === "paid").reduce((s, f) => s + Number(f.amount || 0), 0),
+    };
+  });
+}
+
+function renderPendingAcksSection() {
+  // Unacknowledged notifications, sorted by severity then age (oldest first)
+  const severityOrder = { judicial: 0, danger: 1, warning: 2, info: 3 };
+  const pending = state.notifications
+    .filter(n => !n.acknowledgedAt)
+    .sort((a, b) => {
+      const sa = severityOrder[a.severity] ?? 4;
+      const sb = severityOrder[b.severity] ?? 4;
+      if (sa !== sb) return sa - sb;
+      return (a.createdAt || 0) - (b.createdAt || 0);
+    });
+
+  if (pending.length === 0) {
+    return `
+      <div style="margin-top: 14px; padding: 14px 18px; background: var(--light-gold); border-left: 3px solid var(--garnet);">
+        <div style="font-family: 'Cormorant Garamond', Georgia, serif; font-size: 16px; font-weight: 600; color: var(--garnet);">
+          ✓ All notifications acknowledged
+        </div>
+        <div style="font-family: Georgia, serif; font-size: 12px; color: var(--slate); margin-top: 4px;">
+          Every brother has seen their notifications.
+        </div>
+      </div>`;
+  }
+
+  const grouped = { judicial: [], danger: [], warning: [], info: [] };
+  pending.forEach(n => {
+    const s = grouped[n.severity] ? n.severity : "info";
+    grouped[s].push(n);
+  });
+
+  const severityColors = {
+    judicial: "var(--dagger)",
+    danger:   "var(--memphis-brick)",
+    warning:  "var(--key-gold)",
+    info:     "var(--garnet)",
+  };
+
+  return `
+    <div style="margin-top: 14px;">
+      <div style="font-family: Georgia, serif; font-size: 13px; color: var(--slate); margin-bottom: 10px; line-height: 1.5;">
+        ${pending.length} notification${pending.length === 1 ? "" : "s"} unread. Brothers see these as full-screen modals on next sign-in.
+      </div>
+      <div style="display: flex; flex-direction: column; gap: 6px;">
+        ${pending.slice(0, 25).map(n => {
+          const ageHours = n.createdAt ? Math.floor((Date.now() - n.createdAt) / 3600000) : 0;
+          const ageLabel = ageHours < 1 ? "just now"
+                         : ageHours < 24 ? `${ageHours}h ago`
+                         : `${Math.floor(ageHours / 24)}d ago`;
+          const stale = ageHours >= 48;
+          const recipientShort = (n.recipientEmail || "").split("@")[0];
+          return `
+            <div style="padding: 10px 14px; background: white; border-left: 3px solid ${severityColors[n.severity] || "var(--garnet)"}; display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap;">
+              <div style="flex: 1; min-width: 200px;">
+                <div style="font-family: Georgia, serif; font-size: 13px; line-height: 1.4;">
+                  <strong style="color: ${severityColors[n.severity] || "var(--garnet)"};">${escapeHtml(n.title || "Notification")}</strong>
+                  <span style="color: var(--knight-steel); font-size: 11px; margin-left: 6px;">→ ${escapeHtml(recipientShort)}</span>
+                </div>
+              </div>
+              <span style="font-family: Arial; font-size: 9px; letter-spacing: 1.5px; color: ${stale ? "var(--memphis-brick)" : "var(--knight-steel)"}; ${stale ? "font-weight: bold;" : ""} text-transform: uppercase;">
+                ${ageLabel}${stale ? " • stale" : ""}
+              </span>
+            </div>`;
+        }).join("")}
+        ${pending.length > 25 ? `<div style="font-family: Arial; font-size: 11px; color: var(--knight-steel); text-align: center; padding: 8px; letter-spacing: 1px;">+ ${pending.length - 25} more</div>` : ""}
+      </div>
+    </div>`;
+}
+
+function renderWatchlistSection() {
+  const all = computeParticipation();
+  const watchlist = all.filter(p => p.onWatchlist).sort((a, b) => a.ratio - b.ratio);
+
+  if (state.events.length === 0 && state.meetings.length === 0) {
+    return `<div class="empty">No meetings or events recorded yet this quarter.</div>`;
+  }
+  if (watchlist.length === 0) {
+    return `
+      <div style="margin-top: 14px; padding: 18px; background: var(--light-gold); border-left: 3px solid var(--garnet);">
+        <div style="font-family: 'Cormorant Garamond', Georgia, serif; font-size: 18px; font-weight: 600; color: var(--garnet);">
+          ✓ No brothers below 50% this quarter
+        </div>
+        <div style="font-family: Georgia, serif; font-size: 13px; color: var(--slate); margin-top: 6px;">
+          Watchlist only flags brothers with 3+ chapter events on record. Below that threshold, the sample size is too small to meaningfully judge participation.
+        </div>
+      </div>`;
+  }
+
+  return `
+    <div style="margin-top: 14px;">
+      <div style="font-family: Georgia, serif; font-size: 13px; color: var(--slate); margin-bottom: 10px; line-height: 1.5;">
+        Brothers below 50% combined attendance (chapter meetings + chapter events) this quarter, per Article VI §12. Sgt-at-Arms / judicial board to review.
+      </div>
+      <div style="display: flex; flex-direction: column; gap: 8px;">
+        ${watchlist.map(p => `
+          <div style="padding: 12px 14px; background: white; border-left: 3px solid var(--dagger); display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap;">
+            <div style="flex: 1; min-width: 200px;">
+              <div style="font-family: 'Cormorant Garamond', Georgia, serif; font-size: 16px; font-weight: 600; color: var(--dagger);">
+                ${escapeHtml(p.brother.firstName + " " + p.brother.lastName)}
+                <span style="font-family: Arial; font-size: 9px; color: var(--knight-steel); letter-spacing: 1.5px; margin-left: 6px;">${escapeHtml((p.brother.status || "").toUpperCase())}</span>
+              </div>
+              <div style="font-family: Arial, sans-serif; font-size: 11px; color: var(--slate); margin-top: 3px;">
+                ${p.totalAttended}/${p.totalEvents} attended &middot;
+                ${p.meetingsAttended}/${p.meetingsTotal} meetings &middot;
+                ${p.eventsAttended}/${p.eventsTotal} events
+              </div>
+            </div>
+            <div style="text-align: right;">
+              <div style="font-family: 'Cormorant Garamond', Georgia, serif; font-size: 22px; font-weight: 700; color: var(--memphis-brick);">
+                ${Math.round(p.ratio * 100)}%
+              </div>
+              <div style="font-family: Arial; font-size: 9px; letter-spacing: 1.5px; color: var(--memphis-brick); text-transform: uppercase; font-weight: bold;">
+                Below 50%
+              </div>
+            </div>
+          </div>`).join("")}
+      </div>
+    </div>`;
+}
+
+// ----- Excel exports -----
+function exportReport(kind) {
+  if (typeof XLSX === "undefined") {
+    return toast("Excel library not loaded — refresh the page", true);
+  }
+
+  const q = state.selectedQuarter;
+  const qLabel = formatQuarter(q).replace(/\s+/g, "-");
+  const today = new Date().toISOString().slice(0, 10);
+
+  let rows = [];
+  let filename = "";
+
+  switch (kind) {
+    case "attendance": {
+      const all = computeParticipation();
+      rows = all.map(p => ({
+        "Last Name":      p.brother.lastName,
+        "First Name":     p.brother.firstName,
+        "Status":         p.brother.status || "",
+        "Email":          p.brother.email || "",
+        "Meetings Total": p.meetingsTotal,
+        "Meetings Attended": p.meetingsAttended,
+        "Events Total":   p.eventsTotal,
+        "Events Attended": p.eventsAttended,
+        "Combined Total": p.totalEvents,
+        "Combined Attended": p.totalAttended,
+        "Attendance %":   p.totalEvents > 0 ? Math.round(p.ratio * 100) + "%" : "—",
+        "Below 50%":      p.onWatchlist ? "YES" : "",
+        "Free Absences Used": p.absencesApproved + "/3",
+        "No-Shows":       p.noShows,
+        "Fines Pending ($)": p.finesPending,
+        "Fines Paid ($)": p.finesPaid,
+      }));
+      filename = `pike-attendance-per-brother-${qLabel}-${today}.xlsx`;
+      break;
+    }
+
+    case "noshows": {
+      const ns = state.noShows
+        .filter(n => q === "all" || n.quarter === q)
+        .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+      rows = ns.map(n => ({
+        "Brother":        n.brotherName || "",
+        "Email":          n.email || "",
+        "Meeting":        n.meetingTitle || "",
+        "Meeting Date":   n.meetingDate || "",
+        "Reason":         noShowReasonLabel(n.reason),
+        "Count (1/2/3)":  n.count,
+        "Quarter":        formatQuarter(n.quarter),
+        "Recorded At":    n.timestamp ? new Date(n.timestamp).toLocaleString() : "",
+        "Appealed":       n.appealed ? "Yes" : "",
+        "Appeal Status":  n.appealStatus || "",
+        "Appeal Reason":  n.appealReason || "",
+        "Appeal Note":    n.appealResolverNote || "",
+      }));
+      filename = `pike-noshow-ledger-${qLabel}-${today}.xlsx`;
+      break;
+    }
+
+    case "fines": {
+      const fl = state.fines
+        .filter(f => q === "all" || f.quarter === q)
+        .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+      rows = fl.map(f => ({
+        "Brother":        f.brotherName || "",
+        "Email":          f.email || "",
+        "Amount ($)":     f.amount || 0,
+        "Reason":         f.reason || "",
+        "Meeting":        f.meetingTitle || "",
+        "Meeting Date":   f.meetingDate || "",
+        "Status":         (f.status || "").toUpperCase(),
+        "Created":        f.createdAt ? new Date(f.createdAt).toLocaleString() : "",
+        "Paid At":        f.paidAt ? new Date(f.paidAt).toLocaleString() : "",
+        "Paid Marked By": f.paidMarkedBy || "",
+        "Waived At":      f.waivedAt ? new Date(f.waivedAt).toLocaleString() : "",
+        "Waive Reason":   f.waiveReason || "",
+        "Quarter":        formatQuarter(f.quarter),
+      }));
+      filename = `pike-fine-ledger-${qLabel}-${today}.xlsx`;
+      break;
+    }
+
+    case "absences": {
+      const reqs = state.absenceRequests
+        .filter(r => q === "all" || r.quarter === q)
+        .sort((a, b) => (b.submittedAt || 0) - (a.submittedAt || 0));
+      rows = reqs.map(r => ({
+        "Brother":        r.brotherName || "",
+        "Email":          r.email || "",
+        "Meeting":        r.meetingTitle || "",
+        "Meeting Date":   r.meetingDate || "",
+        "Mandatory":      r.mandatory ? "Yes" : "",
+        "Reason":         REASON_LABELS[r.reason] || r.reason || "",
+        "Description":    r.description || "",
+        "Status":         (r.status || "").toUpperCase(),
+        "Submitted":      r.submittedAt ? new Date(r.submittedAt).toLocaleString() : "",
+        "Reviewed":       r.reviewedAt ? new Date(r.reviewedAt).toLocaleString() : "",
+        "Reviewed By":    r.reviewedBy || "",
+        "Reviewer Note":  r.reviewerNote || "",
+        "Quarter":        formatQuarter(r.quarter),
+      }));
+      filename = `pike-absence-requests-${qLabel}-${today}.xlsx`;
+      break;
+    }
+
+    case "combined": {
+      const all = computeParticipation()
+        .sort((a, b) => a.ratio - b.ratio);
+      rows = all.map(p => ({
+        "Last Name":          p.brother.lastName,
+        "First Name":         p.brother.firstName,
+        "Status":             p.brother.status || "",
+        "Email":              p.brother.email || "",
+        "Meetings Attended":  `${p.meetingsAttended} / ${p.meetingsTotal}`,
+        "Events Attended":    `${p.eventsAttended} / ${p.eventsTotal}`,
+        "Combined Attended":  `${p.totalAttended} / ${p.totalEvents}`,
+        "Participation %":    p.totalEvents > 0 ? Math.round(p.ratio * 100) + "%" : "—",
+        "Watchlist (<50%)":   p.onWatchlist ? "FLAGGED" : "",
+        "No-Shows":           p.noShows,
+        "Outstanding Fines":  "$" + p.finesPending,
+      }));
+      filename = `pike-participation-combined-${qLabel}-${today}.xlsx`;
+      break;
+    }
+
+    default:
+      return toast("Unknown export type", true);
+  }
+
+  if (rows.length === 0) {
+    return toast("No data to export for this quarter", true);
+  }
+
+  try {
+    const ws = XLSX.utils.json_to_sheet(rows);
+    // Auto-width columns based on header + max content length
+    const headers = Object.keys(rows[0]);
+    ws["!cols"] = headers.map(h => {
+      const maxLen = Math.max(
+        h.length,
+        ...rows.map(r => String(r[h] ?? "").length)
+      );
+      return { wch: Math.min(Math.max(maxLen + 2, 10), 50) };
+    });
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, formatQuarter(q).slice(0, 30));
+    XLSX.writeFile(wb, filename);
+    toast(`Downloaded ${rows.length} row${rows.length === 1 ? "" : "s"}`);
+  } catch (e) {
+    console.error(e);
+    toast("Export failed — check console", true);
+  }
+}
+
+function renderFineRow(f, mode) {
+  const ago = f.createdAt ? relativeTime(f.createdAt) : "";
+  const paidAgo = f.paidAt ? relativeTime(f.paidAt) : "";
+
+  return `
+    <div style="padding: 10px 14px; background: white; border-left: 3px solid ${mode === "pending" ? "var(--memphis-brick)" : "var(--garnet)"}; display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap;">
+      <div style="flex: 1; min-width: 200px;">
+        <div style="font-family: Georgia, serif; font-size: 14px;">
+          <strong>${escapeHtml(f.brotherName)}</strong>
+          &middot; <span style="color: ${mode === "pending" ? "var(--memphis-brick)" : "var(--garnet)"}; font-weight: bold;">$${f.amount}</span>
+          &middot; <span style="color: var(--slate); font-size: 12px;">${escapeHtml(f.reason || "")}</span>
+        </div>
+        <div style="font-family: Arial, sans-serif; font-size: 10px; color: var(--knight-steel); margin-top: 3px; letter-spacing: 0.5px;">
+          ${escapeHtml(f.meetingTitle || "")} &middot; ${escapeHtml(fmtDate(f.meetingDate || ""))} &middot; created ${ago}
+          ${mode === "paid" ? ` &middot; paid ${paidAgo}` : ""}
+        </div>
+      </div>
+      ${mode === "pending" ? `
+        <div style="display: flex; gap: 6px;">
+          <button class="btn btn-small" data-paid="${f.id}">Mark Paid</button>
+          <button class="btn btn-ghost btn-small" data-waive="${f.id}">Waive</button>
+        </div>` : ""}
+    </div>`;
+}
+
+async function handleMarkFinePaid(id) {
+  if (!confirm("Mark this fine as paid? This action is logged.")) return;
+  const fine = state.fines.find(f => f.id === id);
+  try {
+    await fines.markPaid(id);
+    toast("Fine marked paid");
+
+    // Notify the brother — receipt-style
+    if (fine && fine.email) {
+      await notify(
+        fine.email,
+        "fine_paid",
+        "Fine Paid ✓",
+        `Your $${fine.amount} fine for ${fine.meetingTitle || "missing a meeting"} has been marked paid by the treasurer. Receipt logged on ${new Date().toLocaleDateString()}.`,
+        "info",
+        id
+      );
+    }
+  } catch (e) {
+    console.error(e);
+    toast("Update failed — treasurer/exec only", true);
+  }
+}
+
+async function handleWaiveFine(id) {
+  const reason = prompt("Reason for waiving this fine? (Optional but recommended)");
+  if (reason === null) return; // user cancelled
+  try {
+    await fines.waive(id, reason || "");
+    toast("Fine waived");
+  } catch (e) {
+    console.error(e);
+    toast("Update failed — treasurer/exec only", true);
+  }
+}
+
+// ===================================================================
+// SETTINGS
+// ===================================================================
+function renderSettings() {
+  $("setting-vc-email").value = state.settings.judicialViceChair || "";
+  $("setting-sgt-email").value = state.settings.sgtAtArmsEmail || SGT_AT_ARMS_EMAIL;
+  $("setting-treasurer-email").value = state.settings.treasurerEmail || TREASURER_EMAIL;
+  $("setting-secretary-email").value = state.settings.secretaryEmail || SECRETARY_EMAIL;
+  $("setting-president-email").value = state.settings.presidentEmail || PRESIDENT_EMAIL;
+  $("setting-ivp-email").value = state.settings.ivpEmail || IVP_EMAIL;
+  $("setting-fine-amount").value = state.settings.fineAmount || FINE_AMOUNT_DEFAULT;
+  $("setting-notes").value = state.settings.notes || "";
+}
+
+$("settings-save").addEventListener("click", async () => {
+  if (!state.user || !state.user.isExec) {
+    return toast("Only exec can change settings", true);
+  }
+  try {
+    await settings.save({
+      judicialViceChair: $("setting-vc-email").value.trim().toLowerCase(),
+      sgtAtArmsEmail:    $("setting-sgt-email").value.trim().toLowerCase(),
+      treasurerEmail:    $("setting-treasurer-email").value.trim().toLowerCase(),
+      secretaryEmail:    $("setting-secretary-email").value.trim().toLowerCase(),
+      presidentEmail:    $("setting-president-email").value.trim().toLowerCase(),
+      ivpEmail:          $("setting-ivp-email").value.trim().toLowerCase(),
+      fineAmount:        Math.max(0, Math.min(500, Number($("setting-fine-amount").value) || FINE_AMOUNT_DEFAULT)),
+      notes:             $("setting-notes").value.trim(),
+    });
+    toast("Settings saved");
+  } catch (e) {
+    console.error(e);
+    toast("Save failed — exec sign-in required", true);
+  }
+});
+
+// ===================================================================
+// MAINTENANCE — Orphan cleanup
+// ===================================================================
+// Finds any no_show / fine / meeting_attendance / absence_request whose
+// meetingId doesn't match an existing meeting, and deletes them.
+// Idempotent. Safe to run anytime.
+// ===================================================================
+$("settings-cleanup-orphans").addEventListener("click", async () => {
+  if (!state.user || !state.user.isExec) {
+    return toast("Only exec can run cleanup", true);
+  }
+
+  const liveMeetingIds = new Set(state.meetings.map(m => m.id));
+
+  // Find orphans across all four collections
+  const orphanNoShows = state.noShows.filter(n => !liveMeetingIds.has(n.meetingId));
+  const orphanFines   = state.fines.filter(f => !liveMeetingIds.has(f.meetingId));
+  const orphanAtt     = state.attendance.filter(a => !liveMeetingIds.has(a.meetingId));
+  const orphanReqs    = state.absenceRequests.filter(r => !liveMeetingIds.has(r.meetingId));
+
+  const total = orphanNoShows.length + orphanFines.length + orphanAtt.length + orphanReqs.length;
+
+  if (total === 0) {
+    $("settings-cleanup-status").textContent = "No orphans found ✓";
+    toast("No orphan records to clean up");
+    return;
+  }
+
+  const summary = [];
+  if (orphanNoShows.length) summary.push(`${orphanNoShows.length} no-show${orphanNoShows.length === 1 ? "" : "s"}`);
+  if (orphanFines.length)   summary.push(`${orphanFines.length} fine${orphanFines.length === 1 ? "" : "s"}`);
+  if (orphanAtt.length)     summary.push(`${orphanAtt.length} attendance record${orphanAtt.length === 1 ? "" : "s"}`);
+  if (orphanReqs.length)    summary.push(`${orphanReqs.length} absence request${orphanReqs.length === 1 ? "" : "s"}`);
+
+  const ok = confirm(
+    `Found ${total} orphaned record${total === 1 ? "" : "s"}:\n\n• ${summary.join("\n• ")}\n\n` +
+    `Delete them all? This cannot be undone.`
+  );
+  if (!ok) return;
+
+  $("settings-cleanup-status").textContent = "Cleaning...";
+
+  let deleted = 0;
+  let failed = 0;
+
+  // Use the same per-collection remove() methods we already have
+  for (const r of orphanNoShows) {
+    try { await noShows.remove(r.id); deleted++; }
+    catch (e) { console.warn("noShow", r.id, e); failed++; }
+  }
+  for (const r of orphanFines) {
+    try { await fines.remove(r.id); deleted++; }
+    catch (e) { console.warn("fine", r.id, e); failed++; }
+  }
+  for (const r of orphanAtt) {
+    try { await attendance.remove(r.id); deleted++; }
+    catch (e) { console.warn("attendance", r.id, e); failed++; }
+  }
+  for (const r of orphanReqs) {
+    try { await absenceRequests.cancel(r.id); deleted++; }
+    catch (e) { console.warn("request", r.id, e); failed++; }
+  }
+
+  $("settings-cleanup-status").textContent = `Cleaned ${deleted}${failed ? " (" + failed + " failed)" : ""} ✓`;
+  toast(`Cleaned up ${deleted} orphan record${deleted === 1 ? "" : "s"}${failed ? ` — ${failed} failed (see console)` : ""}`);
+});
+
+// ===================================================================
+// MAINTENANCE — Deduplicate no-shows
+// ===================================================================
+// Finds (brotherKey, meetingId) pairs with multiple no_show records,
+// keeps the earliest by timestamp, deletes the rest. Also waives any
+// extra fines created by the duplicates.
+// ===================================================================
+$("settings-dedupe-noshows").addEventListener("click", async () => {
+  if (!state.user || !state.user.isExec) {
+    return toast("Only exec can run cleanup", true);
+  }
+
+  // Group no-shows by (brotherKey, meetingId)
+  const groups = new Map();
+  for (const n of state.noShows) {
+    const key = `${n.brotherKey}|${n.meetingId}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(n);
+  }
+
+  // Find duplicate groups
+  const duplicates = [];
+  for (const [key, list] of groups) {
+    if (list.length > 1) {
+      // Sort by timestamp ascending — keep first, mark rest for deletion
+      list.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+      duplicates.push({ keep: list[0], remove: list.slice(1) });
+    }
+  }
+
+  // Find duplicate fines (more than one for same brother/meeting)
+  const fineGroups = new Map();
+  for (const f of state.fines) {
+    const key = `${f.brotherKey}|${f.meetingId}`;
+    if (!fineGroups.has(key)) fineGroups.set(key, []);
+    fineGroups.get(key).push(f);
+  }
+  const dupeFines = [];
+  for (const [key, list] of fineGroups) {
+    if (list.length > 1) {
+      list.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+      dupeFines.push(...list.slice(1));
+    }
+  }
+
+  const totalNoShows = duplicates.reduce((s, d) => s + d.remove.length, 0);
+  const totalFines = dupeFines.length;
+  const total = totalNoShows + totalFines;
+
+  if (total === 0) {
+    $("settings-dedupe-status").textContent = "No duplicates found ✓";
+    toast("No duplicate no-shows or fines");
+    return;
+  }
+
+  const ok = confirm(
+    `Found duplicates:\n\n` +
+    `• ${totalNoShows} duplicate no-show record${totalNoShows === 1 ? "" : "s"} ` +
+    `(across ${duplicates.length} brother/meeting pair${duplicates.length === 1 ? "" : "s"})\n` +
+    `• ${totalFines} duplicate fine record${totalFines === 1 ? "" : "s"}\n\n` +
+    `Keep the earliest of each, delete the rest? Cannot be undone.`
+  );
+  if (!ok) return;
+
+  $("settings-dedupe-status").textContent = "Deduplicating...";
+
+  let deleted = 0;
+  let failed = 0;
+
+  for (const dup of duplicates) {
+    for (const ns of dup.remove) {
+      try { await noShows.remove(ns.id); deleted++; }
+      catch (e) { console.warn("noShow", ns.id, e); failed++; }
+    }
+  }
+  for (const f of dupeFines) {
+    try { await fines.remove(f.id); deleted++; }
+    catch (e) { console.warn("fine", f.id, e); failed++; }
+  }
+
+  $("settings-dedupe-status").textContent = `Removed ${deleted}${failed ? " (" + failed + " failed)" : ""} ✓`;
+  toast(`Removed ${deleted} duplicate record${deleted === 1 ? "" : "s"}${failed ? ` — ${failed} failed (see console)` : ""}`);
+});
+
+// ===================================================================
+// MAINTENANCE — Orphan notifications cleanup
+// ===================================================================
+// Notifications whose relatedId points to a record that no longer
+// exists. Common cause: meeting deleted before Stage 5C cascade fix.
+// ===================================================================
+$("settings-cleanup-notifs").addEventListener("click", async () => {
+  if (!state.user || !state.user.isExec) {
+    return toast("Only exec can run cleanup", true);
+  }
+
+  // Build set of all live IDs that notifications might reference
+  const liveIds = new Set();
+  state.meetings.forEach(m => liveIds.add(m.id));
+  state.noShows.forEach(n => liveIds.add(n.id));
+  state.fines.forEach(f => liveIds.add(f.id));
+  state.absenceRequests.forEach(r => liveIds.add(r.id));
+
+  // Orphan = has a relatedId that's not in any live collection.
+  // Notifications with no relatedId are kept (legacy/system messages).
+  const orphans = state.notifications.filter(n =>
+    n.relatedId && !liveIds.has(n.relatedId)
+  );
+
+  if (orphans.length === 0) {
+    $("settings-cleanup-notifs-status").textContent = "No orphans found ✓";
+    toast("No orphaned notifications");
+    return;
+  }
+
+  const ok = confirm(
+    `Found ${orphans.length} orphaned notification${orphans.length === 1 ? "" : "s"} ` +
+    `(notifications whose source record was deleted). Delete them all? Cannot be undone.`
+  );
+  if (!ok) return;
+
+  $("settings-cleanup-notifs-status").textContent = "Cleaning...";
+
+  let deleted = 0;
+  let failed = 0;
+
+  // Batch deletes for performance with 500+ records
+  for (let i = 0; i < orphans.length; i += 50) {
+    const batch = orphans.slice(i, i + 50);
+    await Promise.all(batch.map(n =>
+      notifications.remove(n.id)
+        .then(() => deleted++)
+        .catch(e => { console.warn("notif", n.id, e); failed++; })
+    ));
+    // Show progress for big batches
+    if (orphans.length > 100) {
+      $("settings-cleanup-notifs-status").textContent = `Cleaning... ${deleted}/${orphans.length}`;
+    }
+  }
+
+  $("settings-cleanup-notifs-status").textContent = `Cleaned ${deleted}${failed ? " (" + failed + " failed)" : ""} ✓`;
+  toast(`Cleaned up ${deleted} orphan notification${deleted === 1 ? "" : "s"}${failed ? ` — ${failed} failed (see console)` : ""}`);
 });
 
 // ===================================================================
 // INIT
 // ===================================================================
-$("ev-date").valueAsDate = new Date();
-const preselect = readHash();
-if (preselect) activateTab("checkin");
+const preselectMeeting = readHash();
+if (preselectMeeting) activateTab("rollcall");
+
+renderQuarterSelectors();
+renderAll();
+startRollCallTimer();
+
+// Default the date input on the create form to 2 weeks from today — the
+// recommended lead time, so brothers have room to submit absence requests
+// and mandatory meetings clear the 14-day notice rule.
+function defaultMeetingDate(force) {
+  const dateInput = $("mtg-date");
+  if (!dateInput || (dateInput.value && !force)) return;
+  const d = new Date();
+  d.setDate(d.getDate() + 14);
+  const pad = n => String(n).padStart(2, "0");
+  dateInput.value = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+// Live readout under the date/time row: how far out the meeting is and
+// what that means for absence requests.
+function updateLeadTimeHint() {
+  const el = $("mtg-leadtime");
+  if (!el) return;
+  const date  = $("mtg-date")?.value;
+  const start = $("mtg-start")?.value;
+  const mand  = $("mtg-mandatory")?.checked;
+  if (!date || !start) { el.className = "mtg-leadtime"; el.textContent = ""; return; }
+
+  const hours = (combineLocalDateTime(date, start).getTime() - Date.now()) / 3600000;
+  const days  = hours / 24;
+  const when  = hours < 48
+    ? `${Math.max(0, Math.round(hours))} hour${Math.round(hours) === 1 ? "" : "s"} away`
+    : `${Math.floor(days)} day${Math.floor(days) === 1 ? "" : "s"} away`;
+
+  let level, msg;
+  if (hours <= 0) {
+    level = "bad";  msg = "This time has already passed.";
+  } else if (hours < 48) {
+    level = "bad";  msg = `${when}. Absence requests will be closed for this meeting, so brothers will have to contact the secretary directly.`;
+  } else if (mand && days < 14) {
+    level = "warn"; msg = `${when}. Mandatory meetings need 14 days' notice (Article VI §12).`;
+  } else if (days < 14) {
+    level = "warn"; msg = `${when}. Brothers have until 48 hours before to request an absence. Two weeks out is recommended.`;
+  } else {
+    level = "good"; msg = `${when}. Plenty of time for brothers to plan and submit absence requests.`;
+  }
+  el.className = "mtg-leadtime is-" + level;
+  el.textContent = msg;
+}
