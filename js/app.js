@@ -49,7 +49,68 @@ const $ = (id) => document.getElementById(id);
 // ===================================================================
 // AUTH UI
 // ===================================================================
+// ===================================================================
+// WELCOME BACK CARD (exec only). Last visit stored in this browser only.
+// ===================================================================
+let _welcome = null;
+function toMs(v) {
+  if (!v) return 0;
+  if (typeof v === "number") return v;
+  if (typeof v.toMillis === "function") return v.toMillis();
+  const n = Date.parse(v); return isNaN(n) ? 0 : n;
+}
+function startWelcomeBack(email) {
+  const key = "pike-attendance:lastSeen:" + String(email || "").toLowerCase();
+  let since = null;
+  try { const v = Number(localStorage.getItem(key)); if (v > 0) since = v; } catch (e) {}
+  try { localStorage.setItem(key, String(Date.now())); } catch (e) {}
+  _welcome = { since, dismissed: false };
+}
+function renderWelcomeBack() {
+  const el = $("welcome-back");
+  if (!el) return;
+  if (!state.user || !_welcome || _welcome.dismissed) { el.dataset.html = ""; el.innerHTML = ""; return; }
+  const since = _welcome.since;
+  const isNew = t => since != null && toMs(t) > since;
+  const items = [];
+  const newCi = state.checkins.filter(c => isNew(c.timestamp));
+  if (newCi.length) {
+    const evs = new Set(newCi.map(c => c.eventId)).size;
+    items.push({ num: newCi.length, label: "New check-in" + (newCi.length === 1 ? "" : "s"), detail: `across ${evs} event${evs === 1 ? "" : "s"}` });
+  }
+  const newEv = state.events.filter(e => isNew(e.createdAt));
+  if (newEv.length) items.push({ num: newEv.length, label: "New event" + (newEv.length === 1 ? "" : "s"), detail: newEv.map(e => e.name).slice(0, 2).join(", ") });
+  const today = new Date().toISOString().slice(0, 10);
+  const next = state.events.filter(e => e.date && e.date >= today).sort((a, b) => a.date.localeCompare(b.date))[0];
+  if (next) items.push({ num: next.date === today ? "Today" : formatDate(next.date).slice(0, 5), label: "Next event", detail: next.name });
+  if (state.roster.length) items.push({ num: state.roster.length, label: "Brothers on roster", detail: "" });
+  const _em = String(state.user.email || "").toLowerCase();
+  const _me = state.roster.find(b => String(b.email || "").toLowerCase() === _em);
+  const name = _me ? _me.firstName : _em.split("@")[0];
+  const sub = since == null ? "Here's where things stand." :
+    `Here's what's new since ${new Date(since).toLocaleDateString(undefined, { month: "short", day: "numeric" })}.`;
+  const hasNews = newCi.length || newEv.length;
+  const html = `
+    <section class="welcome-card" aria-label="Welcome back">
+      <button class="wb-close" type="button" aria-label="Dismiss" id="wb-close">&times;</button>
+      <div class="wb-eyebrow">Iota Pi · Event Tracker</div>
+      <div class="wb-title">${since == null ? "Hey" : "Welcome back"}, ${escapeHtml(name)}</div>
+      <div class="wb-sub">${sub}</div>
+      ${items.length ? `<div class="wb-grid">${items.map(i => `
+        <div class="wb-item"><div class="wb-num">${escapeHtml(String(i.num))}</div>
+        <div><div class="wb-label">${escapeHtml(i.label)}</div>${i.detail ? `<div class="wb-detail">${escapeHtml(i.detail)}</div>` : ""}</div></div>`).join("")}</div>` : ""}
+      ${!hasNews && since != null ? `<div class="wb-caught">You're all caught up. No new check-ins since your last visit.</div>` : ""}
+    </section>`;
+  if (el.dataset.html === html) return;
+  el.dataset.html = html;
+  el.innerHTML = html;
+  $("wb-close").addEventListener("click", () => { _welcome.dismissed = true; el.dataset.html = ""; el.innerHTML = ""; });
+}
+function safeWelcome() { try { renderWelcomeBack(); } catch (e) { console.warn("Welcome card skipped:", e); } }
+
 authApi.onChange((user) => {
+  if (user && !state.user) startWelcomeBack(user.email);
+  if (!user) _welcome = null;
   state.user = user;
   $("auth-status").innerHTML = user
     ? `Signed in as <strong>${escapeHtml(user.email)}</strong>`
@@ -62,6 +123,7 @@ authApi.onChange((user) => {
   renderEventsListInChecklist();
   renderRoster();
   renderAttendance();
+  safeWelcome();
 });
 
 $("auth-signin").addEventListener("click", async () => {
@@ -84,6 +146,7 @@ $("auth-signout").addEventListener("click", async () => {
 // ===================================================================
 events.subscribe((list) => {
   state.events = list;
+  safeWelcome();
   renderEventsList();
   renderEventsListInChecklist();
   renderAttendance();
@@ -92,6 +155,7 @@ events.subscribe((list) => {
 
 roster.subscribe((list) => {
   state.roster = list;
+  safeWelcome();
   $("roster-loading").style.display = "none";
   renderRoster();
   renderAttendance();
@@ -99,6 +163,7 @@ roster.subscribe((list) => {
 
 checkins.subscribe((list) => {
   state.checkins = list;
+  safeWelcome();
   renderAttendance();
   renderRoster();
   renderEventsList();
@@ -575,7 +640,7 @@ function showImportPreview(parsed) {
     <div style="font-family: Georgia, serif; font-size: 14px; margin-bottom: 8px;">
       <strong style="color: var(--garnet);">${parsed.length}</strong> brothers found in file
     </div>
-    <div style="font-family: Arial, sans-serif; font-size: 11px; letter-spacing: 1px; text-transform: uppercase; line-height: 1.7;">
+    <div style="font-family: Arial, sans-serif; font-size: 11px; letter-spacing: 0.5px; text-transform: uppercase; line-height: 1.7;">
       <span style="color: var(--garnet);">+ ${newCount} new</span> &nbsp;·&nbsp;
       <span style="color: var(--gold-ink);">~ ${updateCount} updates</span> &nbsp;·&nbsp;
       <span style="color: var(--burgundy);">${removedIfRep} would be removed if Replace All</span>
@@ -584,8 +649,8 @@ function showImportPreview(parsed) {
   previewEl.innerHTML = parsed.slice(0, 50).map(b => {
     const isNew = !currentKeys.has(brotherKeyOf(b));
     return `<div style="padding:8px 12px; border-bottom:1px solid var(--light-gold); display:flex; justify-content:space-between; align-items:center; font-family:Georgia,serif; font-size:13px;">
-      <span>${escapeHtml(b.firstName + " " + b.lastName)} &nbsp;<span style="font-family:Arial; font-size:9px; letter-spacing:1px; text-transform:uppercase; color:var(--gold-ink);">${escapeHtml(b.status)}</span></span>
-      <span style="font-family:Arial; font-size:9px; letter-spacing:1px; text-transform:uppercase; color:${isNew ? "var(--garnet)" : "var(--slate)"};">${isNew ? "NEW" : "EXISTING"}</span>
+      <span>${escapeHtml(b.firstName + " " + b.lastName)} &nbsp;<span style="font-family:Arial; font-size:9px; letter-spacing:0.5px; text-transform:uppercase; color:var(--gold-ink);">${escapeHtml(b.status)}</span></span>
+      <span style="font-family:Arial; font-size:9px; letter-spacing:0.5px; text-transform:uppercase; color:${isNew ? "var(--garnet)" : "var(--slate)"};">${isNew ? "NEW" : "EXISTING"}</span>
     </div>`;
   }).join("") + (parsed.length > 50
     ? `<div style="padding:8px 12px; font-family:Georgia,serif; font-style:italic; color:var(--gold-ink); font-size:12px;">+ ${parsed.length - 50} more...</div>`

@@ -19,7 +19,7 @@
   <div class="auth-bar">
     <span id="auth-status">Not signed in</span>
     <button id="auth-signin">Exec Sign In</button>
-    <button id="auth-signout" style="display:none;">Sign Out</button>
+    <button id="auth-signout" class="signout-btn" style="display:none;" aria-label="Sign out" title="Sign out"><span class="so-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg></span><span class="so-text">Sign out</span></button>
   </div>
 
   <!-- ============== HEADER ============== -->
@@ -38,6 +38,9 @@
     <a href="https://uclapikes-hub.github.io/pike-meetings/" target="_blank" rel="noopener">Meetings ↗</a>
   </div>
   <!-- ============== TABS ============== -->
+  <!-- Welcome Back card (exec, once per sign-in) -->
+  <div id="welcome-back"></div>
+
   <div class="tabs">
     <button class="tab active" data-tab="checkin">Check In</button>
     <button class="tab" data-tab="events">Events</button>
@@ -226,7 +229,7 @@
           </span>
         </div>
       </div>
-      <div id="roster-loading" class="empty" style="grid-column: span 2;">Loading roster…</div>
+      <div id="roster-loading" class="empty" style="grid-column: span 2;"><span class="pike-spinner" aria-hidden="true"></span>Loading roster…</div>
       <div class="roster-grid" id="roster-grid"></div>
     </div>
   </div>
