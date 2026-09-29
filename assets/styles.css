@@ -1540,3 +1540,10 @@ html[data-theme="dark"] .roster-status.st-inactive { background-color: rgba(159,
   .row-2, .row-3 { row-gap: 0 !important; }
   .card label:not(.checkbox-label):not(.toggle) { margin-top: 20px; }
 }
+
+/* Dock on narrow phones: stretch edge to edge so six sections fit */
+@media (max-width: 400px) {
+  #pike-dock { left: 8px; right: 8px; transform: none; max-width: none; gap: 2px; padding: 6px; justify-content: space-between; }
+  .dock-item { flex: 1 1 0; min-width: 0 !important; padding: 6px 1px 5px; }
+  #pike-dock .dock-label { font-size: 9.5px !important; letter-spacing: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+}
