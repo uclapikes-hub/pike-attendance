@@ -5,6 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>PIKE Event Check-In</title>
 
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500..700;1,500..700&family=Gantari:ital,wght@0,400..700;1,400..700&display=swap">
 <link rel="stylesheet" href="assets/styles.css">
 
 <!-- External libraries: QR code generator + Excel export -->
@@ -50,6 +53,9 @@
 
   <!-- ============== CHECK-IN PANEL ============== -->
   <div class="panel active" id="panel-checkin">
+
+    <!-- Live clock + Westwood weather -->
+    <div id="now-widgets"></div>
     <div class="card">
       <div class="card-title">Brother Check-In</div>
       <div class="card-sub">Sign in to log your attendance</div>
@@ -206,7 +212,7 @@
           <button class="btn" id="ab-add" type="button">+ Add</button>
         </div>
         <div style="margin-top: 12px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding-top: 12px; border-top: 1px dashed rgba(170,151,103,0.4);">
-          <span style="font-family: Georgia, serif; font-size: 12px; font-style: italic; color: var(--slate);">
+          <span style="font-family: var(--font-body); font-size: 12px; font-style: italic; color: var(--slate);">
             Got a CSV or Excel file? Bulk-import the whole roster:
           </span>
           <button class="btn btn-ghost btn-small" id="import-roster-btn" type="button">Import Roster</button>
@@ -224,7 +230,7 @@
           </select>
         </div>
         <div class="filter-group">
-          <span style="font-family: Georgia, serif; font-style: italic; color: var(--gold-ink); font-size: 13px;">
+          <span style="font-family: var(--font-body); font-style: italic; color: var(--gold-ink); font-size: 13px;">
             <span id="roster-total">0</span> brothers
           </span>
         </div>
@@ -251,7 +257,7 @@
       <button class="btn btn-danger btn-small" id="import-replace" type="button">Replace All</button>
       <button class="btn btn-ghost btn-small" id="import-cancel" type="button">Cancel</button>
     </div>
-    <div style="margin-top: 14px; font-family: Georgia, serif; font-size: 11px; font-style: italic; color: var(--gold-ink); text-align: left;">
+    <div style="margin-top: 14px; font-family: var(--font-body); font-size: 11px; font-style: italic; color: var(--gold-ink); text-align: left;">
       <strong style="color: var(--garnet); font-style: normal;">Merge:</strong> add new brothers, update existing ones (matched by name), keep all others.<br>
       <strong style="color: var(--burgundy); font-style: normal;">Replace All:</strong> wipe the current roster and use only what's in the file.
     </div>

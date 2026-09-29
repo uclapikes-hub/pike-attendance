@@ -637,10 +637,10 @@ function showImportPreview(parsed) {
   const removedIfRep = state.roster.filter(b => !importedKeys.has(b.key)).length;
 
   summary.innerHTML = `
-    <div style="font-family: Georgia, serif; font-size: 14px; margin-bottom: 8px;">
+    <div style="font-family: var(--font-body); font-size: 14px; margin-bottom: 8px;">
       <strong style="color: var(--garnet);">${parsed.length}</strong> brothers found in file
     </div>
-    <div style="font-family: Arial, sans-serif; font-size: 11px; letter-spacing: 1px; text-transform: uppercase; line-height: 1.7;">
+    <div style="font-family: var(--font-ui); font-size: 11px; letter-spacing: 1px; text-transform: uppercase; line-height: 1.7;">
       <span style="color: var(--garnet);">+ ${newCount} new</span> &nbsp;·&nbsp;
       <span style="color: var(--gold-ink);">~ ${updateCount} updates</span> &nbsp;·&nbsp;
       <span style="color: var(--burgundy);">${removedIfRep} would be removed if Replace All</span>
@@ -648,12 +648,12 @@ function showImportPreview(parsed) {
 
   previewEl.innerHTML = parsed.slice(0, 50).map(b => {
     const isNew = !currentKeys.has(brotherKeyOf(b));
-    return `<div style="padding:8px 12px; border-bottom:1px solid var(--light-gold); display:flex; justify-content:space-between; align-items:center; font-family:Georgia,serif; font-size:13px;">
-      <span>${escapeHtml(b.firstName + " " + b.lastName)} &nbsp;<span style="font-family:Arial; font-size:9px; letter-spacing:1px; text-transform:uppercase; color:var(--gold-ink);">${escapeHtml(b.status)}</span></span>
-      <span style="font-family:Arial; font-size:9px; letter-spacing:1px; text-transform:uppercase; color:${isNew ? "var(--garnet)" : "var(--slate)"};">${isNew ? "NEW" : "EXISTING"}</span>
+    return `<div style="padding:8px 12px; border-bottom:1px solid var(--light-gold); display:flex; justify-content:space-between; align-items:center; font-family:var(--font-body); font-size:13px;">
+      <span>${escapeHtml(b.firstName + " " + b.lastName)} &nbsp;<span style="font-family:var(--font-ui); font-size:9px; letter-spacing:1px; text-transform:uppercase; color:var(--gold-ink);">${escapeHtml(b.status)}</span></span>
+      <span style="font-family:var(--font-ui); font-size:9px; letter-spacing:1px; text-transform:uppercase; color:${isNew ? "var(--garnet)" : "var(--slate)"};">${isNew ? "NEW" : "EXISTING"}</span>
     </div>`;
   }).join("") + (parsed.length > 50
-    ? `<div style="padding:8px 12px; font-family:Georgia,serif; font-style:italic; color:var(--gold-ink); font-size:12px;">+ ${parsed.length - 50} more...</div>`
+    ? `<div style="padding:8px 12px; font-family:var(--font-body); font-style:italic; color:var(--gold-ink); font-size:12px;">+ ${parsed.length - 50} more...</div>`
     : "");
 
   importModal.classList.add("visible");
@@ -848,8 +848,125 @@ window.addEventListener("hashchange", () => {
 });
 
 // ===================================================================
+// NOW WIDGETS: live clock + Westwood weather (Open-Meteo, no API key)
+// Self-contained. If the weather service is unreachable the weather
+// card simply hides; nothing else on the page depends on it.
+// ===================================================================
+var _wx = null;   // latest weather payload (var: safe to read before init)
+const NW_TZ = "America/Los_Angeles";
+const NW_URL = "https://api.open-meteo.com/v1/forecast?latitude=34.0689&longitude=-118.4452" +
+  "&current=temperature_2m,weather_code,is_day&daily=temperature_2m_max,temperature_2m_min" +
+  "&hourly=temperature_2m,weather_code&temperature_unit=fahrenheit&timezone=America%2FLos_Angeles&forecast_days=16";
+
+function wxDescribe(code, isDay) {
+  const c = Number(code);
+  if (c === 0) return { label: "Clear", kind: isDay ? "sun" : "moon" };
+  if (c === 1) return { label: "Mostly clear", kind: isDay ? "sun" : "moon" };
+  if (c === 2) return { label: "Partly cloudy", kind: isDay ? "sun-cloud" : "moon-cloud" };
+  if (c === 3) return { label: "Overcast", kind: "cloud" };
+  if (c === 45 || c === 48) return { label: "Fog", kind: "cloud" };
+  if (c >= 51 && c <= 57) return { label: "Drizzle", kind: "rain" };
+  if ((c >= 61 && c <= 67) || (c >= 80 && c <= 82)) return { label: "Rain", kind: "rain" };
+  if ((c >= 71 && c <= 77) || c === 85 || c === 86) return { label: "Snow", kind: "rain" };
+  if (c >= 95) return { label: "Thunderstorms", kind: "rain" };
+  return { label: "—", kind: "cloud" };
+}
+
+function wxIcon(kind) {
+  const sun  = `<span class="nw-sun"><span class="nw-sun-core"></span><span class="nw-sun-glow"></span></span>`;
+  const moon = `<svg class="nw-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>`;
+  const cloud = cls => `<svg class="nw-cloud ${cls || ""}" viewBox="0 0 64 40" aria-hidden="true"><path d="M50 38H16a14 14 0 0 1-1.8-27.9A18 18 0 0 1 49 12a13 13 0 0 1 1 26z"/></svg>`;
+  const drops = `<span class="nw-drops"><i></i><i></i><i></i></span>`;
+  if (kind === "sun") return sun;
+  if (kind === "moon") return moon;
+  if (kind === "sun-cloud") return sun + cloud("is-front");
+  if (kind === "moon-cloud") return moon + cloud("is-front");
+  if (kind === "rain") return cloud("is-solo") + drops;
+  return cloud("is-solo");
+}
+
+// Forecast for a specific local date + "HH:MM" (used by the Next Meeting card)
+function wxForecastAt(dateStr, timeStr) {
+  if (!_wx || !_wx.hourly || !dateStr) return null;
+  const hr = String(timeStr || "19:00").slice(0, 2);
+  const i = _wx.hourly.time.indexOf(`${dateStr}T${hr}:00`);
+  if (i < 0) return null;
+  const hour = Number(hr);
+  return { temp: Math.round(_wx.hourly.temperature_2m[i]), ...wxDescribe(_wx.hourly.weather_code[i], hour >= 6 && hour < 18) };
+}
+
+function nwTick() {
+  const el = document.getElementById("nw-time");
+  if (!el) return;
+  const now = new Date();
+  const t = now.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone: NW_TZ });
+  const [clock, ampm] = t.split(" ");
+  const h = Number(now.toLocaleString("en-US", { hour: "numeric", hour12: false, timeZone: NW_TZ }));
+  const day = now.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", timeZone: NW_TZ });
+  const night = h >= 18 || h < 6;
+  el.querySelector(".nw-clock").textContent = clock;
+  el.querySelector(".nw-ampm").textContent = ampm || "";
+  el.querySelector(".nw-day").textContent = day;
+  const ic = el.querySelector(".nw-time-icon");
+  const want = night ? "moon" : "sun";
+  if (ic.dataset.kind !== want) { ic.dataset.kind = want; ic.innerHTML = wxIcon(want); }
+  el.classList.toggle("is-night", night);
+}
+
+function nwRenderWeather() {
+  const card = document.getElementById("nw-weather");
+  if (!card) return;
+  if (!_wx || !_wx.current) { card.hidden = true; return; }
+  const c = _wx.current;
+  const d = wxDescribe(c.weather_code, c.is_day === 1);
+  const hi = _wx.daily ? Math.round(_wx.daily.temperature_2m_max[0]) : null;
+  const lo = _wx.daily ? Math.round(_wx.daily.temperature_2m_min[0]) : null;
+  card.hidden = false;
+  card.innerHTML = `
+    <div class="nw-wx-art">${wxIcon(d.kind)}</div>
+    <div class="nw-wx-head"><span class="nw-wx-place">Westwood</span><span class="nw-wx-sub">UCLA · Los Angeles</span></div>
+    <div class="nw-wx-temp">${Math.round(c.temperature_2m)}<span>°F</span></div>
+    <div class="nw-wx-meta">${hi != null ? `H ${hi}° · L ${lo}°` : ""}</div>
+    <div class="nw-wx-pill">${escapeHtml(d.label)}</div>`;
+}
+
+async function nwFetchWeather() {
+  try {
+    const res = await fetch(NW_URL);
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    _wx = await res.json();
+  } catch (e) {
+    console.warn("Weather unavailable:", e.message || e);
+  }
+  nwRenderWeather();
+  if (typeof nwOnWeather === "function") { try { nwOnWeather(); } catch (e) {} }
+}
+
+function initNowWidgets() {
+  const slot = document.getElementById("now-widgets");
+  if (!slot) return;
+  slot.innerHTML = `
+    <div class="nw-row">
+      <div class="nw-card nw-time" id="nw-time">
+        <div class="nw-time-icon"></div>
+        <div class="nw-label">Right now</div>
+        <div><span class="nw-clock"></span><span class="nw-ampm"></span></div>
+        <div class="nw-day"></div>
+      </div>
+      <div class="nw-card nw-weather" id="nw-weather" hidden></div>
+    </div>`;
+  nwTick();
+  setInterval(nwTick, 15000);
+  nwFetchWeather();
+  setInterval(nwFetchWeather, 30 * 60 * 1000);
+}
+
+// ===================================================================
 // INIT
 // ===================================================================
 $("ev-date").valueAsDate = new Date();
 const preselect = readHash();
 if (preselect) activateTab("checkin");
+
+// Live clock + weather (never allowed to break the page)
+try { initNowWidgets(); } catch (e) { console.warn("Now widgets skipped:", e); }
