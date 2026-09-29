@@ -640,7 +640,7 @@ function showImportPreview(parsed) {
     <div style="font-family: Georgia, serif; font-size: 14px; margin-bottom: 8px;">
       <strong style="color: var(--garnet);">${parsed.length}</strong> brothers found in file
     </div>
-    <div style="font-family: Arial, sans-serif; font-size: 11px; letter-spacing: 0.5px; text-transform: uppercase; line-height: 1.7;">
+    <div style="font-family: Arial, sans-serif; font-size: 11px; letter-spacing: 1px; text-transform: uppercase; line-height: 1.7;">
       <span style="color: var(--garnet);">+ ${newCount} new</span> &nbsp;·&nbsp;
       <span style="color: var(--gold-ink);">~ ${updateCount} updates</span> &nbsp;·&nbsp;
       <span style="color: var(--burgundy);">${removedIfRep} would be removed if Replace All</span>
@@ -649,8 +649,8 @@ function showImportPreview(parsed) {
   previewEl.innerHTML = parsed.slice(0, 50).map(b => {
     const isNew = !currentKeys.has(brotherKeyOf(b));
     return `<div style="padding:8px 12px; border-bottom:1px solid var(--light-gold); display:flex; justify-content:space-between; align-items:center; font-family:Georgia,serif; font-size:13px;">
-      <span>${escapeHtml(b.firstName + " " + b.lastName)} &nbsp;<span style="font-family:Arial; font-size:9px; letter-spacing:0.5px; text-transform:uppercase; color:var(--gold-ink);">${escapeHtml(b.status)}</span></span>
-      <span style="font-family:Arial; font-size:9px; letter-spacing:0.5px; text-transform:uppercase; color:${isNew ? "var(--garnet)" : "var(--slate)"};">${isNew ? "NEW" : "EXISTING"}</span>
+      <span>${escapeHtml(b.firstName + " " + b.lastName)} &nbsp;<span style="font-family:Arial; font-size:9px; letter-spacing:1px; text-transform:uppercase; color:var(--gold-ink);">${escapeHtml(b.status)}</span></span>
+      <span style="font-family:Arial; font-size:9px; letter-spacing:1px; text-transform:uppercase; color:${isNew ? "var(--garnet)" : "var(--slate)"};">${isNew ? "NEW" : "EXISTING"}</span>
     </div>`;
   }).join("") + (parsed.length > 50
     ? `<div style="padding:8px 12px; font-family:Georgia,serif; font-style:italic; color:var(--gold-ink); font-size:12px;">+ ${parsed.length - 50} more...</div>`
