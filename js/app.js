@@ -147,6 +147,7 @@ $("auth-signout").addEventListener("click", async () => {
 events.subscribe((list) => {
   state.events = list;
   safeWelcome();
+  setTimeout(safeGetStarted, 0);
   renderEventsList();
   renderEventsListInChecklist();
   renderAttendance();
@@ -240,6 +241,7 @@ function selectBrother(b) {
   ciSuggestions.classList.remove("visible");
   ciClear.classList.remove("visible");
   ciSubmit.disabled = false;
+  safeGetStarted();
 }
 
 function deselectBrother() {
@@ -249,6 +251,7 @@ function deselectBrother() {
   ciSelected.classList.remove("visible");
   ciSubmit.disabled = true;
   ciNameInput.focus();
+  safeGetStarted();
 }
 
 ciNameInput.addEventListener("input", (e) => {
@@ -309,6 +312,7 @@ ciSubmit.addEventListener("click", async () => {
       status:     selectedBrother.status,
       email:      selectedBrother.email,
     });
+    _ciDone = true;
     deselectBrother();
     toast("Checked in — thanks, brother!");
   } catch (e) {
@@ -397,6 +401,17 @@ async function deleteEvent(id) {
 // ===================================================================
 // ATTENDANCE PANEL
 // ===================================================================
+const ATT_PER_PAGE = 10;
+let _attPage = 1, _attFilter = null;
+function pagerPages(cur, total) {
+  if (total <= 7) return Array.from({ length: total }, (_, i) => i + 1);
+  const out = [1];
+  if (cur > 3) out.push("…");
+  for (let n = Math.max(2, cur - 1); n <= Math.min(total - 1, cur + 1); n++) out.push(n);
+  if (cur < total - 2) out.push("…");
+  out.push(total);
+  return out;
+}
 function renderAttendance() {
   $("stat-events").textContent   = state.events.length;
   $("stat-checkins").textContent = state.checkins.length;
@@ -412,7 +427,13 @@ function renderAttendance() {
   filterSel.value = current;
 
   const filterId = filterSel.value;
-  const rows = state.checkins.filter(c => !filterId || c.eventId === filterId);
+  const allRows = state.checkins.filter(c => !filterId || c.eventId === filterId);
+  // Pagination (10 per page); reset to page 1 when the filter changes
+  if (_attFilter !== filterId) { _attFilter = filterId; _attPage = 1; }
+  const totalPages = Math.max(1, Math.ceil(allRows.length / ATT_PER_PAGE));
+  _attPage = Math.min(Math.max(1, _attPage), totalPages);
+  const startIdx = (_attPage - 1) * ATT_PER_PAGE;
+  const rows = allRows.slice(startIdx, startIdx + ATT_PER_PAGE);
 
   const wrap = $("attendance-table-wrap");
   if (!rows.length) {
@@ -436,7 +457,20 @@ function renderAttendance() {
         ${canEdit ? `<td><button class="btn btn-danger btn-small" data-del-ci="${c.id}">×</button></td>` : ""}
       </tr>`;
     }).join("")}</tbody>
-  </table>`;
+  </table>
+  ${allRows.length > ATT_PER_PAGE ? `
+  <div class="pager" role="navigation" aria-label="Attendance pages">
+    <span class="pager-summary">${startIdx + 1} to ${Math.min(startIdx + ATT_PER_PAGE, allRows.length)} of ${allRows.length} check-ins</span>
+    <span class="pager-controls">
+      <button type="button" class="pager-btn" data-page="${_attPage - 1}" ${_attPage === 1 ? "disabled" : ""} aria-label="Previous page">&lsaquo; Prev</button>
+      ${pagerPages(_attPage, totalPages).map(n => n === "…" ? `<span class="pager-gap">…</span>` :
+        `<button type="button" class="pager-btn pager-num${n === _attPage ? " is-active" : ""}" data-page="${n}" ${n === _attPage ? 'aria-current="page"' : ""}>${n}</button>`).join("")}
+      <button type="button" class="pager-btn" data-page="${_attPage + 1}" ${_attPage === totalPages ? "disabled" : ""} aria-label="Next page">Next &rsaquo;</button>
+    </span>
+  </div>` : ""}`;
+  wrap.querySelectorAll(".pager-btn[data-page]").forEach(b =>
+    b.addEventListener("click", () => { _attPage = Number(b.dataset.page); renderAttendance(); })
+  );
 
   wrap.querySelectorAll("[data-del-ci]").forEach(b =>
     b.addEventListener("click", async () => {
@@ -1059,6 +1093,163 @@ function initNowWidgets() {
 }
 
 // ===================================================================
+// GET STARTED GUIDE: step checklist with progress + troubleshooting
+// ===================================================================
+const GS_CHECK = `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="m8.5 12.5 2.3 2.3 4.7-5.1"/></svg>`;
+const GS_OPEN  = `<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10"/></svg>`;
+
+function pikeRenderGetStarted(el, cfg) {
+  if (!el) return;
+  const done = cfg.steps.filter(s => s.done).length;
+  const total = cfg.steps.length;
+  const pct = Math.round((done / total) * 100);
+  const html = `
+    <details class="gs-card" id="gs-details">
+      <summary>
+        <div class="gs-head">
+          <span class="gs-eyebrow">${done === total ? "All set" : "Get started"}</span>
+          <span class="gs-count">${done} of ${total} steps</span>
+        </div>
+        <div class="gs-title">${escapeHtml(cfg.title)}</div>
+        <div class="gs-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><span style="width:${pct}%"></span></div>
+      </summary>
+      <ol class="gs-steps">
+        ${cfg.steps.map(s => `
+          <li class="${s.done ? "is-done" : ""}">
+            <span class="gs-icon">${s.done ? GS_CHECK : GS_OPEN}</span>
+            <span><span class="gs-label">${escapeHtml(s.label)}</span>
+            ${s.detail ? `<span class="gs-detail">${escapeHtml(s.detail)}</span>` : ""}</span>
+          </li>`).join("")}
+      </ol>
+      <div class="gs-help">
+        <div class="gs-help-title">Having trouble?</div>
+        <div class="gs-tips">
+          ${cfg.tips.map(t => `<div class="gs-tip"><div class="gs-tip-q">${escapeHtml(t.q)}</div><div class="gs-tip-a">${escapeHtml(t.a)}</div></div>`).join("")}
+        </div>
+        <button class="btn btn-ghost btn-small gs-refresh" type="button">Refresh page</button>
+      </div>
+    </details>`;
+  if (el.dataset.html === html) return;
+  const prev = el.querySelector("#gs-details");
+  const wasOpen = prev ? prev.open : null;
+  el.dataset.html = html;
+  el.innerHTML = html;
+  const det = el.querySelector("#gs-details");
+  det.open = wasOpen != null && el.dataset.touched === "1" ? wasOpen : !!cfg.startOpen;
+  det.addEventListener("toggle", () => { el.dataset.touched = "1"; });
+  el.querySelector(".gs-refresh").addEventListener("click", () => window.location.reload());
+}
+
+let _ciDone = false;
+function renderGetStartedEvents() {
+  const evSel = document.getElementById("ci-event");
+  const hasEvent = state.events.length > 0 && !!(evSel && evSel.value);
+  pikeRenderGetStarted($("get-started"), {
+    title: "Checking in to an event",
+    steps: [
+      { label: "Choose the event", done: hasEvent,
+        detail: hasEvent ? "" : (state.events.length ? "Pick it from the Select Event list below." : "No events yet. Expecting one? Refresh the page.") },
+      { label: "Find your name", done: !!selectedBrother || _ciDone,
+        detail: (selectedBrother || _ciDone) ? "" : "Type at least 2 letters of your first or last name, then tap it in the list." },
+      { label: "Tap Check In", done: _ciDone,
+        detail: _ciDone ? "" : "You'll see a confirmation. One check-in per event." },
+    ],
+    tips: [
+      { q: "Don't see the event?", a: "Refresh the page. Events show up as soon as an exec creates them, but a tab left open can fall behind." },
+      { q: "Your name isn't in the list?", a: "Try your last name. Still missing? Ask an exec to add you in the Roster tab." },
+      { q: "Scanned a QR code?", a: "The event is picked for you. Just find your name and tap Check In." },
+    ],
+  });
+}
+function safeGetStarted() { try { renderGetStartedEvents(); } catch (e) { console.warn("Get Started skipped:", e); } }
+// ===================================================================
+// THEME SWITCHER: System / Light / Dark (saved per browser)
+// ===================================================================
+const THEME_ICONS = {
+  system: `<svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>`,
+  light:  `<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>`,
+  dark:   `<svg viewBox="0 0 24 24"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/><path d="M19 3v4M21 5h-4"/></svg>`,
+};
+const THEME_ORDER = ["system", "light", "dark"];
+function themeGet() { try { return localStorage.getItem("pike-theme") || "system"; } catch (e) { return "system"; } }
+function themeApply(pref) {
+  const dark = pref === "dark" || (pref === "system" && window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+  document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
+}
+function initThemeSwitcher() {
+  const bar = document.querySelector(".auth-bar");
+  if (!bar || document.querySelector(".theme-switch")) return;
+  const wrap = document.createElement("div");
+  wrap.className = "theme-switch"; wrap.setAttribute("role", "radiogroup"); wrap.setAttribute("aria-label", "Color theme");
+  wrap.innerHTML = `<span class="ts-pill" aria-hidden="true"></span>` + THEME_ORDER.map(v =>
+    `<button type="button" role="radio" data-theme-value="${v}" aria-label="${v[0].toUpperCase() + v.slice(1)} theme" title="${v[0].toUpperCase() + v.slice(1)}">${THEME_ICONS[v]}</button>`).join("");
+  bar.insertBefore(wrap, bar.firstChild);
+  const sync = () => {
+    const pref = themeGet();
+    wrap.querySelectorAll("button").forEach(b => b.setAttribute("aria-checked", String(b.dataset.themeValue === pref)));
+    wrap.querySelector(".ts-pill").style.transform = `translateX(${THEME_ORDER.indexOf(pref) * 34}px)`;
+  };
+  wrap.addEventListener("click", e => {
+    const b = e.target.closest("button[data-theme-value]"); if (!b) return;
+    try { localStorage.setItem("pike-theme", b.dataset.themeValue); } catch (err) {}
+    themeApply(b.dataset.themeValue); sync();
+  });
+  wrap.addEventListener("keydown", e => {
+    if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
+    const i = THEME_ORDER.indexOf(themeGet()), n = (i + (e.key === "ArrowRight" ? 1 : 2)) % 3;
+    wrap.querySelectorAll("button")[n].click(); wrap.querySelectorAll("button")[n].focus();
+  });
+  try { window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { if (themeGet() === "system") themeApply("system"); }); } catch (e) {}
+  themeApply(themeGet()); sync();
+}
+
+// ===================================================================
+// MOBILE DOCK: floating bottom navigation that mirrors the tab bar.
+// Each dock button just clicks the matching .tab, so app logic is shared.
+// ===================================================================
+const DOCK_ICONS = {
+  rollcall:   '<path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>',
+  checkin:    '<path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>',
+  meetings:   '<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/>',
+  events:     '<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18M8 14h.01M12 14h.01M16 14h.01"/>',
+  absence:    '<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18M10 14l4 4M14 14l-4 4"/>',
+  reports:    '<path d="M3 3v18h18"/><path d="M7 16v-4M12 16V8M17 16v-7"/>',
+  attendance: '<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/>',
+  roster:     '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/>',
+  settings:   '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>',
+};
+const DOCK_SHORT = { absence: "Absences", rollcall: "Roll Call", checkin: "Check In" };
+function initDock() {
+  const tabs = [...document.querySelectorAll(".tabs .tab")];
+  if (!tabs.length || document.getElementById("pike-dock")) return;
+  const dock = document.createElement("nav");
+  dock.id = "pike-dock"; dock.setAttribute("aria-label", "Sections");
+  dock.innerHTML = tabs.map(t => {
+    const k = t.dataset.tab;
+    return `<button type="button" class="dock-item" data-dock="${k}" aria-label="${escapeHtml(t.textContent.trim())}">
+      <span class="dock-icon"><svg viewBox="0 0 24 24" aria-hidden="true">${DOCK_ICONS[k] || DOCK_ICONS.meetings}</svg></span>
+      <span class="dock-label">${escapeHtml(DOCK_SHORT[k] || t.textContent.trim())}</span></button>`;
+  }).join("");
+  document.body.appendChild(dock);
+  dock.addEventListener("click", e => {
+    const b = e.target.closest(".dock-item"); if (!b) return;
+    const t = document.querySelector(`.tabs .tab[data-tab="${b.dataset.dock}"]`);
+    if (t) { t.click(); window.scrollTo({ top: 0, behavior: "smooth" }); }
+  });
+  const sync = () => {
+    tabs.forEach(t => {
+      const b = dock.querySelector(`[data-dock="${t.dataset.tab}"]`); if (!b) return;
+      b.classList.toggle("is-active", t.classList.contains("active"));
+      b.setAttribute("aria-current", t.classList.contains("active") ? "page" : "false");
+      b.hidden = getComputedStyle(t).display === "none";   // mirror role-hidden tabs
+    });
+  };
+  new MutationObserver(sync).observe(document.querySelector(".tabs"), { subtree: true, attributes: true, attributeFilter: ["class", "style"] });
+  new MutationObserver(sync).observe(document.body, { attributes: true, attributeFilter: ["class"] });
+  sync();
+}
+
+// ===================================================================
 // INIT
 // ===================================================================
 $("ev-date").valueAsDate = new Date();
@@ -1067,3 +1258,12 @@ if (preselect) activateTab("checkin");
 
 // Live clock + weather (never allowed to break the page)
 try { initNowWidgets(); } catch (e) { console.warn("Now widgets skipped:", e); }
+
+// Get Started guide
+try { document.getElementById("ci-event").addEventListener("change", safeGetStarted); safeGetStarted(); } catch (e) {}
+
+// Theme switcher
+try { initThemeSwitcher(); } catch (e) { console.warn("Theme switcher skipped:", e); }
+
+// Mobile dock
+try { initDock(); } catch (e) { console.warn("Dock skipped:", e); }
