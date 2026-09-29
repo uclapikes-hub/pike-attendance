@@ -115,6 +115,11 @@ export const roster = {
     return key;
   },
 
+  async setStatus(key, status) {
+    // Only touches the status field; name, email and history stay as they are.
+    await setDoc(doc(fs, "roster", key), { status }, { merge: true });
+  },
+
   async remove(key) {
     await deleteDoc(doc(fs, "roster", key));
   },

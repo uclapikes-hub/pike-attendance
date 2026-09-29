@@ -90,6 +90,8 @@ function renderWelcomeBack() {
   const sub = since == null ? "Here's where things stand." :
     `Here's what's new since ${new Date(since).toLocaleDateString(undefined, { month: "short", day: "numeric" })}.`;
   const hasNews = newCi.length || newEv.length;
+  // Nothing new since the last visit: stay out of the way instead of showing an empty recap
+  if (!hasNews && since != null) { el.dataset.html = ""; el.innerHTML = ""; return; }
   const html = `
     <section class="welcome-card" aria-label="Welcome back">
       <button class="wb-close" type="button" aria-label="Dismiss" id="wb-close">&times;</button>
@@ -492,6 +494,9 @@ $("filter-event").addEventListener("change", renderAttendance);
 // ===================================================================
 $("roster-search").addEventListener("input", renderRoster);
 $("roster-sort").addEventListener("change", renderRoster);
+$("roster-status-filter").addEventListener("change", renderRoster);
+const ROSTER_STATUSES = ["Active", "New Member", "Alumni", "Inactive"];
+const statusSlug = s => String(s || "Active").toLowerCase().replace(/[^a-z]+/g, "-");
 
 function renderRoster() {
   const search   = $("roster-search").value.trim().toLowerCase();
@@ -511,7 +516,9 @@ function renderRoster() {
     rate:  (counts[b.key] || 0) / totalEvents,
   }));
 
+  const statusFilter = $("roster-status-filter").value;
   let filtered = enriched.filter(b => {
+    if (statusFilter && (b.status || "Active") !== statusFilter) return false;
     if (!search) return true;
     return (b.firstName + " " + b.lastName).toLowerCase().includes(search);
   });
@@ -536,8 +543,17 @@ function renderRoster() {
     const fullName = b.firstName + " " + b.lastName;
     const pct = state.events.length ? Math.round(b.rate * 100) : 0;
     const cls = b.count === 0 ? "zero" : (b.rate >= 0.5 ? "high" : "");
+    const st = b.status || "Active";
+    const statusCtl = canEdit
+      ? `<select class="roster-status st-${statusSlug(st)}" data-status-key="${b.key}" aria-label="Status for ${escapeHtml(fullName)}">
+           ${ROSTER_STATUSES.concat(ROSTER_STATUSES.includes(st) ? [] : [st]).map(o => `<option value="${escapeHtml(o)}"${o === st ? " selected" : ""}>${escapeHtml(o)}</option>`).join("")}
+         </select>`
+      : `<span class="roster-status st-${statusSlug(st)}">${escapeHtml(st)}</span>`;
     return `<div class="roster-item ${cls}">
-      <span class="roster-name">${escapeHtml(fullName)}</span>
+      <div class="roster-who">
+        <span class="roster-name">${escapeHtml(fullName)}</span>
+        ${statusCtl}
+      </div>
       <div style="display:flex; align-items:center;">
         <div class="roster-bar-wrap">
           <span class="roster-count">${b.count} / ${state.events.length} • ${pct}%</span>
@@ -551,6 +567,26 @@ function renderRoster() {
   grid.querySelectorAll("[data-del-brother]").forEach(b =>
     b.addEventListener("click", () => deleteBrother(b.dataset.delBrother))
   );
+  grid.querySelectorAll("[data-status-key]").forEach(sel =>
+    sel.addEventListener("change", () => changeStatus(sel))
+  );
+}
+
+async function changeStatus(sel) {
+  const b = state.roster.find(x => x.key === sel.dataset.statusKey);
+  if (!b) return;
+  const prev = b.status || "Active", next = sel.value;
+  if (next === prev) return;
+  sel.disabled = true;
+  try {
+    await roster.setStatus(b.key, next);
+    toast(`${b.firstName} ${b.lastName} is now ${next}`);
+  } catch (e) {
+    sel.value = prev;
+    toast("Couldn't update status. Are you signed in as exec?", true);
+  } finally {
+    sel.disabled = false;
+  }
 }
 
 async function deleteBrother(key) {
