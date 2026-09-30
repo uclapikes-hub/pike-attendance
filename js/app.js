@@ -120,6 +120,7 @@ authApi.onChange((user) => {
   $("auth-signin").style.display  = user ? "none" : "";
   $("auth-signout").style.display = user ? ""    : "none";
   document.body.classList.toggle("is-exec", !!user);
+  safeEventsCalendar();
   // Re-render to show/hide exec-only controls (delete buttons, create event, etc.)
   renderEventsList();
   renderEventsListInChecklist();
@@ -148,6 +149,7 @@ $("auth-signout").addEventListener("click", async () => {
 // ===================================================================
 events.subscribe((list) => {
   state.events = list;
+  safeEventsCalendar();
   safeWelcome();
   setTimeout(safeGetStarted, 0);
   renderEventsList();
@@ -1348,3 +1350,138 @@ try { initThemeSwitcher(); } catch (e) { console.warn("Theme switcher skipped:",
 
 // Mobile dock
 try { initDock(); } catch (e) { console.warn("Dock skipped:", e); }
+
+// ===================================================================
+// CHAPTER CALENDAR: a month you swipe through, one day at a time.
+// Dots mark meetings (garnet) and events (gold); tap a day for its agenda.
+// ===================================================================
+const _cal = { month: null, sel: null, lastScrollKey: "" };
+function calYmd(d) { const p = n => String(n).padStart(2, "0"); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`; }
+function calParse(ymd) { const [y, m, d] = ymd.split("-").map(Number); return new Date(y, m - 1, d); }
+function calTime(t) {
+  if (!t) return "";
+  const [h, m] = t.split(":").map(Number); const ap = h >= 12 ? "PM" : "AM";
+  return `${((h + 11) % 12) + 1}:${String(m).padStart(2, "0")} ${ap}`;
+}
+function calEsc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+
+// items: [{ date:"YYYY-MM-DD", time:"19:00", title, where, kind:"meeting"|"event", tag, strong }]
+function renderChapterCalendar(el, items, opts) {
+  if (!el) return;
+  opts = opts || {};
+  const today = calYmd(new Date());
+  if (!_cal.sel) _cal.sel = today;
+  if (!_cal.month) { const d = calParse(_cal.sel); _cal.month = new Date(d.getFullYear(), d.getMonth(), 1); }
+  const m0 = _cal.month, y = m0.getFullYear(), mo = m0.getMonth();
+  const days = new Date(y, mo + 1, 0).getDate();
+  const byDay = {};
+  items.forEach(it => { if (it && it.date) (byDay[it.date] = byDay[it.date] || []).push(it); });
+  Object.values(byDay).forEach(list => list.sort((a, b) => (a.time || "99").localeCompare(b.time || "99")));
+
+  let strip = "";
+  for (let i = 1; i <= days; i++) {
+    const d = new Date(y, mo, i), key = calYmd(d), list = byDay[key] || [];
+    const hasM = list.some(x => x.kind === "meeting"), hasE = list.some(x => x.kind === "event"), strong = list.some(x => x.strong);
+    const cls = ["cal-day", key === _cal.sel ? "is-sel" : "", key === today ? "is-today" : "", key < today ? "is-past" : "", list.length ? "has-items" : ""].join(" ");
+    const label = d.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" }) + (list.length ? `, ${list.length} item${list.length === 1 ? "" : "s"}` : "");
+    strip += `<button type="button" class="${cls}" data-cal-day="${key}" aria-label="${calEsc(label)}" aria-pressed="${key === _cal.sel}">
+      <span class="cal-dow">${d.toLocaleDateString(undefined, { weekday: "short" }).slice(0, 1)}</span>
+      <span class="cal-num">${i}</span>
+      <span class="cal-dots">${hasM ? `<i class="cal-dot is-m${strong ? " is-strong" : ""}"></i>` : ""}${hasE ? `<i class="cal-dot is-e"></i>` : ""}</span>
+    </button>`;
+  }
+
+  const selList = byDay[_cal.sel] || [];
+  const selDate = calParse(_cal.sel);
+  const next = items.filter(it => it.date > _cal.sel).sort((a, b) => (a.date + (a.time || "")).localeCompare(b.date + (b.time || "")))[0];
+  const agenda = selList.length
+    ? selList.map(it => `
+      <div class="cal-item is-${it.kind}${it.strong ? " is-strong" : ""}">
+        <div class="cal-time">${it.time ? calEsc(calTime(it.time)) : "All day"}</div>
+        <div class="cal-what"><b>${calEsc(it.title)}</b>${it.where || it.tag ? `<span>${calEsc([it.where, it.tag].filter(Boolean).join(" · "))}</span>` : ""}</div>
+        <span class="cal-kind">${it.kind === "meeting" ? "Meeting" : "Event"}</span>
+      </div>`).join("")
+    : `<div class="cal-empty">Nothing on the calendar${_cal.sel === today ? " today" : ""}.${next ? ` <button type="button" class="cal-jump" data-cal-jump="${next.date}">Next up: ${calEsc(next.title)} · ${calParse(next.date).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" })} →</button>` : ""}</div>`;
+  const canAdd = opts.onAdd && opts.addLabel && _cal.sel >= today;
+
+  const html = `
+    <section class="cal" aria-label="Chapter calendar">
+      <div class="cal-head">
+        <div>
+          <div class="cal-eyebrow">${calEsc(opts.eyebrow || "Chapter Calendar")}</div>
+          <div class="cal-month">${m0.toLocaleDateString(undefined, { month: "long" })} <span>${y}</span></div>
+        </div>
+        <div class="cal-nav">
+          <button type="button" class="cal-btn" data-cal-nav="-1" aria-label="Previous month"><svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></svg></button>
+          <button type="button" class="cal-today" data-cal-nav="0">Today</button>
+          <button type="button" class="cal-btn" data-cal-nav="1" aria-label="Next month"><svg viewBox="0 0 24 24"><path d="M9 18l6-6-6-6"/></svg></button>
+        </div>
+      </div>
+      <div class="cal-strip-wrap"><div class="cal-strip">${strip}</div></div>
+      <div class="cal-agenda">
+        <div class="cal-agenda-head">
+          <span class="cal-agenda-date">${selDate.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })}</span>
+          <span class="cal-legend">${items.some(x => x.kind === "meeting") ? `<i class="cal-dot is-m"></i>Meeting` : ""}${items.some(x => x.kind === "event") ? `<i class="cal-dot is-e"></i>Event` : ""}</span>
+        </div>
+        ${agenda}
+      </div>
+      ${canAdd ? `<div class="cal-foot"><button type="button" class="cal-add" data-cal-add="${_cal.sel}"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>${calEsc(opts.addLabel)} ${selDate.toLocaleDateString(undefined, { month: "short", day: "numeric" })}</button></div>` : ""}
+    </section>`;
+  if (el.dataset.html !== html) {
+    const prevWrap = el.querySelector(".cal-strip-wrap"), prevLeft = prevWrap ? prevWrap.scrollLeft : null;
+    el.dataset.html = html; el.innerHTML = html;
+    if (prevLeft != null && _cal.lastScrollKey === _cal.sel + "|" + y + mo) { const w2 = el.querySelector(".cal-strip-wrap"); if (w2) w2.scrollLeft = prevLeft; }
+    el.querySelectorAll("[data-cal-day]").forEach(b => b.addEventListener("click", () => { _cal.sel = b.dataset.calDay; renderChapterCalendar(el, items, opts); }));
+    el.querySelectorAll("[data-cal-nav]").forEach(b => b.addEventListener("click", () => {
+      const step = Number(b.dataset.calNav);
+      if (step === 0) { _cal.sel = today; const t = new Date(); _cal.month = new Date(t.getFullYear(), t.getMonth(), 1); }
+      else {
+        _cal.month = new Date(y, mo + step, 1);
+        const sameDay = new Date(_cal.month.getFullYear(), _cal.month.getMonth(), 1);
+        const first = items.filter(it => it.date && it.date.slice(0, 7) === calYmd(sameDay).slice(0, 7)).sort((a, b) => a.date.localeCompare(b.date))[0];
+        _cal.sel = calYmd(_cal.month) <= today && today.slice(0, 7) === calYmd(_cal.month).slice(0, 7) ? today : (first ? first.date : calYmd(sameDay));
+      }
+      renderChapterCalendar(el, items, opts);
+    }));
+    el.querySelector("[data-cal-jump]")?.addEventListener("click", e => {
+      _cal.sel = e.currentTarget.dataset.calJump; const d = calParse(_cal.sel); _cal.month = new Date(d.getFullYear(), d.getMonth(), 1);
+      renderChapterCalendar(el, items, opts);
+    });
+    el.querySelector("[data-cal-add]")?.addEventListener("click", e => opts.onAdd(e.currentTarget.dataset.calAdd));
+  }
+  // Keep the chosen day in view (only when the choice or month changes, so we never fight the user's scrolling)
+  const key = _cal.sel + "|" + y + mo;
+  const wrap = el.querySelector(".cal-strip-wrap"), btn = el.querySelector(".cal-day.is-sel");
+  if (_cal.lastScrollKey !== key && wrap && btn) {
+    if (wrap.clientWidth > 0) {   // only once it's actually on screen
+      _cal.lastScrollKey = key;
+      wrap.scrollTo({ left: btn.offsetLeft - wrap.clientWidth / 2 + btn.offsetWidth / 2, behavior: "auto" });
+    } else if (!_cal.waitingForLayout) {
+      _cal.waitingForLayout = true;
+      const tryAgain = () => { _cal.waitingForLayout = false; if (wrap.isConnected) renderChapterCalendar(el, items, opts); };
+      if (window.ResizeObserver) { const ro = new ResizeObserver(() => { if (wrap.clientWidth > 0) { ro.disconnect(); tryAgain(); } }); ro.observe(wrap); }
+      else setTimeout(tryAgain, 400);
+    }
+  }
+}
+
+function renderEventsCalendar() {
+  const el = document.getElementById("chapter-calendar"); if (!el) return;
+  const items = (state.events || []).map(e => ({ date: e.date, time: e.time || "", title: e.name, where: e.location, kind: "event", tag: e.type || "" }));
+  const isExec = !!state.user;
+  renderChapterCalendar(el, items, {
+    eyebrow: "Chapter Events",
+    addLabel: isExec ? "Create an event on" : "",
+    onAdd: isExec ? (ymd => {
+      activateTab("events");
+      setTimeout(() => {
+        const d = document.getElementById("ev-date"); if (!d) return;
+        d.value = ymd; d.dispatchEvent(new Event("change", { bubbles: true }));
+        d.closest(".card")?.scrollIntoView({ behavior: "smooth", block: "start" });
+        document.getElementById("ev-name")?.focus({ preventScroll: true });
+      }, 60);
+    }) : null,
+  });
+}
+function safeEventsCalendar() { try { renderEventsCalendar(); } catch (e) { console.warn("Calendar skipped:", e); } }
+safeEventsCalendar();
